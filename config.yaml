@@ -1,0 +1,46 @@
+# ai-agent 설정 파일
+
+local_llm:
+  provider: ollama
+  base_url: "http://192.128.0.229:11345"
+  model: "qwen2.5-coder:14b"
+  router_model: "qwen2.5:3b"   # 라우팅 판단 전용(가벼운 모델). 없으면 model과 동일하게 사용
+  temperature: 0.2
+
+routing:
+  # 1차 규칙 기반 필터 임계값
+  max_local_files: 5
+  max_local_tokens: 32000
+  force_external_keywords:
+    - "전체 리팩토링"
+    - "아키텍처"
+    - "마이그레이션"
+    - "전체 프로젝트"
+
+external_tools:
+  default: claude_code   # local 판단 실패 시 기본 사용 도구: claude_code | codex
+  claude_code:
+    command: ["claude", "-p"]          # 자동 라우팅(비대화형 1회성) 위임용
+    interactive_command: ["claude"]    # /model claude 대화형 핸드오프용 (TTY 전환)
+  codex:
+    command: ["codex", "exec"]         # 자동 라우팅(비대화형 1회성) 위임용
+    interactive_command: ["codex"]     # /model codex 대화형 핸드오프용 (TTY 전환)
+
+harness:
+  # 수정 대상 프로젝트 폴더. 프레임워크 파일(agent.py 등)과 분리하기 위해
+  # 이 하위 폴더 안의 파일만 탐색/수정한다. 프레임워크 루트 전체를 대상으로 하려면 "."
+  work_dir: "workspace"
+  max_recovery_retries: 3
+  verify_timeout_sec: 120
+  backup_dir: ".agent_backup"
+  exclude_dirs:
+    - node_modules
+    - .git
+    - .agent_backup
+    - __pycache__
+    - venv
+    - .venv
+
+logging:
+  log_dir: "logs"
+  level: "INFO"

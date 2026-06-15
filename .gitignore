@@ -1,0 +1,31 @@
+# 가상환경 파일
+.venv/
+
+# 캐시 파일
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 로그 파일
+*.log
+
+# 환경 변수 파일
+.env
+
+# 데이터 파일
+data/
+
+# 모델 파일
+models/
+
+# 결과 파일
+results/
+
+# 기타
+*.tmp
+*.bak
+claude.md
+docs/
+samples/
+.claude/
+venv
