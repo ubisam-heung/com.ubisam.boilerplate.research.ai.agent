@@ -18,7 +18,7 @@ CHATTER_REPLY_PROMPT = """사용자가 일상적인 말을 건넸다. 코딩 에
 def is_chatter(llm, task: str) -> bool:
     """코딩 작업이 아닌 일상대화/잡담이면 True를 반환한다."""
     try:
-        result = llm.generate(CHATTER_CHECK_PROMPT.format(task=task), json_mode=True)
+        result = llm.generate(CHATTER_CHECK_PROMPT.format(task=task), json_mode=True, num_predict=32)
         return not result.get("is_task", True)
     except Exception:
         return False
@@ -27,7 +27,7 @@ def is_chatter(llm, task: str) -> bool:
 def reply_chatter(llm, task: str) -> str:
     """일상대화에 친근하게 짧게 답한다."""
     try:
-        return llm.generate(CHATTER_REPLY_PROMPT.format(task=task))
+        return llm.generate(CHATTER_REPLY_PROMPT.format(task=task), num_predict=150)
     except Exception:
         return "안녕하세요! 개발 관련 작업이 있으면 말씀해주세요."
 

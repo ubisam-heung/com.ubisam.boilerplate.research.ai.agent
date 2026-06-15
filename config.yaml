@@ -4,7 +4,7 @@ local_llm:
   provider: ollama
   base_url: "http://192.168.0.229:11345"
   model: "qwen3.5:9b-mlx"
-  temperature: 0.2
+  temperature: 0.7
 
 routing:
   # 1차 규칙 기반 필터 임계값
