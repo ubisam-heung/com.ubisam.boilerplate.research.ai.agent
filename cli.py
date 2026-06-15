@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -48,7 +49,72 @@ MODELS = ("auto", "local", "claude", "codex")
 _MODEL_ALIASES = {"claude_code": "claude", "claudecode": "claude"}
 
 # 슬래시 없이도 인식할 명령어. (예: "exit" == "/exit")
-BARE_COMMANDS = {"help", "model", "status", "config", "history", "clear", "metrics", "exit", "quit", "q"}
+BARE_COMMANDS = {"help", "model", "status", "config", "history", "clear", "metrics", "save", "exit", "quit", "q"}
+
+
+class SessionRecorder:
+    """CLI 대화 세션(입력 + 출력)을 기록하고 마크다운 파일로 저장한다."""
+
+    def __init__(self, sessions_dir: str):
+        self.sessions_dir = Path(sessions_dir)
+        self.started_at = datetime.now()
+        self.turns: List[dict] = []
+        self._buf: List[str] = []
+        self._cur_input: Optional[str] = None
+        self._cur_model: str = "auto"
+
+    def start_turn(self, user_input: str, model: str):
+        self._cur_input = user_input
+        self._cur_model = model
+        self._buf = []
+
+    def append(self, line: str):
+        if self._cur_input is not None:
+            self._buf.append(line)
+
+    def end_turn(self, interactive: bool = False):
+        if self._cur_input is None:
+            return
+        self.turns.append({
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "model": self._cur_model,
+            "input": self._cur_input,
+            "output": ("(대화형 세션 — TTY 직접 연결, 출력 캡처 불가)"
+                       if interactive else "\n".join(self._buf)),
+            "interactive": interactive,
+        })
+        self._cur_input = None
+        self._buf = []
+
+    def save(self, tag: str = "") -> Optional[Path]:
+        if not self.turns:
+            return None
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        ts = self.started_at.strftime("%Y%m%d_%H%M%S")
+        suffix = f"_{tag}" if tag else ""
+        path = self.sessions_dir / f"{ts}{suffix}.md"
+
+        lines = [
+            f"# AI Agent 세션  {self.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+        ]
+        for i, t in enumerate(self.turns, 1):
+            lines += [
+                f"## [{i}] {t['ts']}  `{t['model']}`",
+                "",
+                "**입력**",
+                "",
+                f"> {t['input']}",
+                "",
+                "**출력**",
+                "",
+                "```",
+                t["output"],
+                "```",
+                "",
+            ]
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return path
 
 _BANNER = """\
 [bold blue] ╔══════════════════════════════════════╗[/bold blue]
@@ -60,14 +126,15 @@ _BANNER = """\
 _HELP = """\
 [bold]명령어[/bold]  [dim](슬래시 없이 입력해도 됩니다: exit == /exit)[/dim]
 
-  [cyan]/help[/cyan]     이 도움말
-  [cyan]/model[/cyan]    실행 모델 선택 (auto·local·claude·codex)
-  [cyan]/status[/cyan]   연결 상태 확인
-  [cyan]/config[/cyan]   현재 설정 보기
-  [cyan]/metrics[/cyan]  작업 지표 요약 (로컬처리율·복구율 등)
-  [cyan]/history[/cyan]  최근 작업 목록
-  [cyan]/clear[/cyan]    화면 지우기
-  [cyan]/exit[/cyan]     종료
+  [cyan]/help[/cyan]            이 도움말
+  [cyan]/model[/cyan]           실행 모델 선택 (auto·local·claude·codex)
+  [cyan]/status[/cyan]          연결 상태 확인
+  [cyan]/config[/cyan]          현재 설정 보기
+  [cyan]/metrics[/cyan]         작업 지표 요약 (로컬처리율·복구율 등)
+  [cyan]/history[/cyan]         최근 작업 목록
+  [cyan]/save [태그][/cyan]     현재 세션을 파일로 저장 (선택: 이름 태그)
+  [cyan]/clear[/cyan]           화면 지우기
+  [cyan]/exit[/cyan]            종료 (세션 자동 저장)
 
 [bold]작업 입력[/bold]
 
@@ -162,7 +229,6 @@ def _check_status(config: dict, project_dir: str) -> dict:
     status = {
         "ollama": False,
         "model": "—",
-        "router_model": None,
         "project_dir": project_dir,
     }
     try:
@@ -173,21 +239,12 @@ def _check_status(config: dict, project_dir: str) -> dict:
         if r.ok:
             status["ollama"] = True
             names = [m["name"] for m in r.json().get("models", [])]
-
-            def best(target: str) -> str:
-                if target in names:
-                    return target
+            target = llm.get("model", "")
+            if target in names:
+                status["model"] = target
+            else:
                 prefix = target.split(":")[0]
-                for n in names:
-                    if n.startswith(prefix):
-                        return n
-                return target
-
-            status["model"] = best(llm.get("model", ""))
-            rm = llm.get("router_model", llm.get("model", ""))
-            router = best(rm)
-            if router != status["model"]:
-                status["router_model"] = router
+                status["model"] = next((n for n in names if n.startswith(prefix)), target)
     except Exception:
         pass
     return status
@@ -205,9 +262,7 @@ def _print_status(status: dict):
 
     if status["ollama"]:
         t.add_row(dot_ok, "Ollama", "[green]연결됨[/green]")
-        t.add_row(dot_ok, "메인 모델", f"[cyan]{escape(status['model'])}[/cyan]")
-        if status["router_model"]:
-            t.add_row(dot_ok, "라우터 모델", f"[cyan]{escape(status['router_model'])}[/cyan]")
+        t.add_row(dot_ok, "모델", f"[cyan]{escape(status['model'])}[/cyan]")
     else:
         t.add_row(dot_err, "Ollama", "[red]연결 안 됨[/red]  →  ollama serve")
 
@@ -234,7 +289,10 @@ def run_interactive(project_dir: str = "."):
     else:
         console.print()
 
-    console.print("  [dim]/help 명령어 목록  ·  /model 모델 선택  ·  /exit 종료[/dim]\n")
+    console.print("  [dim]/help 명령어 목록  ·  /model 모델 선택  ·  /save 저장  ·  /exit 종료[/dim]\n")
+
+    sessions_dir = os.path.join(project_dir, config.get("sessions", {}).get("dir", "sessions"))
+    recorder = SessionRecorder(sessions_dir)
 
     history: List[str] = []
     ui = {"model": "auto"}
@@ -259,17 +317,34 @@ def run_interactive(project_dir: str = "."):
         is_command = task.startswith("/") or low in BARE_COMMANDS or first == "model"
         if is_command:
             norm = task if task.startswith("/") else "/" + task
-            _handle_command(norm, status, config, history, project_dir, ui)
+            _handle_command(norm, status, config, history, project_dir, ui, recorder=recorder)
             if norm.lower().split()[0] in ("/exit", "/quit", "/q"):
                 break
             continue
 
         history.append(task)
-        # claude/codex 선택 시: 비대화형 위임 대신 진짜 대화형 세션으로 핸드오프
+        recorder.start_turn(task, ui["model"])
+
         if ui["model"] in ("claude", "codex"):
+            # 명시적 외부 모델: 대화형 세션으로 전환 후 즉시 저장
             _run_external_interactive(ui["model"], task, _work_root(project_dir, config), config)
+            recorder.end_turn(interactive=True)
+            _autosave(recorder)
+        elif ui["model"] == "local":
+            # 로컬 강제: 기존 파이프라인 실행
+            def _rec_log(msg: str, _r=recorder):
+                _r.append(msg)
+                _rich_log(msg)
+            _run_task(task, project_dir, "local", log_fn=_rec_log)
+            recorder.end_turn()
         else:
-            _run_task(task, project_dir, ui["model"])
+            # auto: 잡담은 로컬, 코딩은 외부 대화형 세션으로 직행
+            _run_auto_mode(task, project_dir, config, recorder)
+
+    # 세션 종료 시 자동 저장
+    saved = recorder.save()
+    if saved:
+        console.print(f"  [dim]세션 자동 저장됨: {escape(str(saved))}[/dim]")
 
     if HAS_READLINE:
         try:
@@ -285,6 +360,7 @@ def _handle_command(
     history: List[str],
     project_dir: str,
     ui: dict,
+    recorder: Optional["SessionRecorder"] = None,
 ):
     cmd = raw.lower().split()[0]
 
@@ -356,6 +432,18 @@ def _handle_command(
             for i, h in enumerate(history[-20:], 1):
                 console.print(f"  [dim]{i:2}.[/dim]  {escape(h)}")
 
+    elif cmd == "/save":
+        if recorder is None:
+            console.print("  [yellow]세션 레코더가 초기화되지 않았습니다.[/yellow]")
+            return
+        parts = raw.split(maxsplit=1)
+        tag = parts[1].strip() if len(parts) > 1 else ""
+        saved = recorder.save(tag=tag)
+        if saved:
+            console.print(f"  [green]✓[/green]  세션 저장됨: [cyan]{escape(str(saved))}[/cyan]")
+        else:
+            console.print("  [dim]저장할 대화 기록이 없습니다.[/dim]")
+
     else:
         console.print(f"  [yellow]알 수 없는 명령어:[/yellow] {escape(raw)}  [dim]— /help 참고[/dim]")
 
@@ -375,7 +463,10 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
     tool_key = "codex" if model == "codex" else "claude_code"
     ext = config.get("external_tools", {}).get(tool_key, {})
     base = ext.get("interactive_command") or ([model] if model == "codex" else ["claude"])
-    cmd = list(base) + ([task] if task else [])
+    cmd = list(base)
+    if model_override := ext.get("model"):
+        cmd += ["--model", model_override]
+    cmd += [task] if task else []
 
     os.makedirs(work_root, exist_ok=True)
     console.print()
@@ -408,16 +499,17 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
     console.print()
 
 
-def _run_task(task: str, project_dir: str, model: str = "auto"):
+def _run_task(task: str, project_dir: str, model: str = "auto", log_fn=None):
     label = task if len(task) <= 55 else task[:52] + "..."
     console.print()
     console.print(Rule(f"[dim]{escape(label)}[/dim]", style="dim blue"))
 
     force = None if model == "auto" else model
+    effective_log = log_fn if log_fn is not None else _rich_log
     start = time.monotonic()
     try:
         from agent import run_agent
-        run_agent(task, root=project_dir, log_fn=_rich_log, force=force, confirm_fn=_rich_confirm)
+        run_agent(task, root=project_dir, log_fn=effective_log, force=force, confirm_fn=_rich_confirm)
     except KeyboardInterrupt:
         console.print("\n  [yellow]⚠[/yellow]  작업이 중단되었습니다.")
     except Exception as exc:
@@ -427,6 +519,70 @@ def _run_task(task: str, project_dir: str, model: str = "auto"):
     console.print()
     console.print(Rule(f"[dim]완료  ({elapsed:.1f}초)[/dim]", style="dim"))
     console.print()
+
+
+def _autosave(recorder: SessionRecorder):
+    """현재 세션을 즉시 파일로 저장하고 경로를 출력한다."""
+    saved = recorder.save()
+    if saved:
+        console.print(f"  [dim]저장됨 → {escape(str(saved))}[/dim]")
+
+
+# 파일 확장자나 명백한 개발 키워드가 있으면 LLM 판단 없이 즉시 외부로
+_CODING_SIGNALS = (
+    ".java", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".cpp", ".c", ".h",
+    ".rb", ".php", ".kt", ".swift", ".cs", ".vue", ".html", ".css", ".sql", ".sh",
+    "테스트", "함수", "클래스", "메서드", "코드", "버그", "수정", "추가", "구현",
+    "리팩토", "빌드", "컴파일", "디버그", "api", "endpoint", "import", "class ",
+    "def ", "return ", "test", "spec", "fix", "implement", "refactor",
+)
+
+
+def _is_obviously_coding(task: str) -> bool:
+    tl = task.lower()
+    return any(sig in task or sig in tl for sig in _CODING_SIGNALS)
+
+
+def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionRecorder):
+    """auto 모드: 명백한 코딩은 즉시 외부 위임, 애매하면 LLM 1회로 잡담/코딩 판단."""
+    ext_default = config.get("external_tools", {}).get("default", "claude_code")
+    model = "claude" if ext_default == "claude_code" else ext_default
+    work_root = _work_root(project_dir, config)
+
+    # 명백한 코딩 신호가 있으면 LLM 호출 없이 즉시 외부로
+    if _is_obviously_coding(task):
+        _run_external_interactive(model, task, work_root, config)
+        recorder.end_turn(interactive=True)
+        _autosave(recorder)
+        return
+
+    # 애매한 경우: LLM 1회로 잡담 여부만 판단
+    from backends.local_llm import LocalLLM
+    from router import is_chatter, reply_chatter
+
+    llm_cfg = config.get("local_llm", {})
+    llm = LocalLLM(
+        model=llm_cfg.get("model", ""),
+        base_url=llm_cfg.get("base_url", ""),
+        temperature=0.0,
+    )
+
+    try:
+        ollama_ok = llm.health_check()
+    except Exception:
+        ollama_ok = False
+
+    if ollama_ok and is_chatter(llm, task):
+        reply = reply_chatter(llm, task)
+        recorder.append(reply)
+        _rich_log(reply)
+        recorder.end_turn()
+        return
+
+    # 잡담 아닌 것으로 판단(또는 Ollama 없음) → 외부 위임
+    _run_external_interactive(model, task, work_root, config)
+    recorder.end_turn(interactive=True)
+    _autosave(recorder)
 
 
 # ─── 단일 작업 모드 ───────────────────────────────────────────────────────────

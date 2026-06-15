@@ -133,7 +133,28 @@ curl -fsSL https://claude.ai/install.sh | bash
 claude --version
 ```
 
-각 CLI를 처음 실행하면 로그인 흐름이 시작됩니다. 한 번 로그인해 두세요.
+각 CLI는 **처음 실행할 때 인증 흐름이 자동으로 시작**됩니다. 아래 절차대로 한 번 로그인해 두면 이후에는 자동으로 인증이 유지됩니다.
+
+**Claude Code 로그인**
+
+```bash
+claude
+```
+
+처음 실행하면 약관 동의 후 아래 두 가지 중 하나를 선택합니다.
+
+- **Claude.ai 계정으로 로그인 (OAuth)** — 브라우저가 열리며 claude.ai 계정으로 로그인하면 토큰이 자동 저장됩니다. Claude Pro / Max 구독 플랜이 필요합니다.
+- **API 키 입력** — Anthropic Console([console.anthropic.com](https://console.anthropic.com))에서 발급한 키를 붙여넣습니다. API 키 과금은 사용량 기반입니다.
+
+인증이 완료되면 `~/.claude/` 디렉토리에 자격 증명이 저장되며, 이후에는 `claude` 실행 시 자동 로그인됩니다.
+
+**Codex CLI 로그인**
+
+```bash
+codex
+```
+
+처음 실행하면 OpenAI API 키를 묻습니다. [platform.openai.com/api-keys](https://platform.openai.com/api-keys)에서 발급한 키를 입력하세요. 입력한 키는 `~/.codex/config.toml`에 저장됩니다.
 
 ---
 
@@ -157,7 +178,14 @@ cd ai-agent
 - `./agent` 실행 파일 생성
 
 > **중요 — 작업 폴더 구조**: 프레임워크 파일(`agent.py` 등)과 수정 대상 코드를 분리합니다.
-> 에이전트는 **`workspace/` 안의 파일만** 탐색·수정합니다. 수정할 프로젝트 코드를 `workspace/`에 두세요.
+> 에이전트는 **`workspace/` 안의 파일만** 탐색·수정합니다. 작업할 프로젝트가 git 저장소라면
+> 에이전트 설치 후 `workspace/` 안에서 `git clone`하거나, 기존 코드를 그대로 복사해 두세요.
+>
+> ```bash
+> cd ~/demo-agent-project/workspace
+> git clone <프로젝트 저장소 URL>
+> ```
+>
 > 대상 폴더는 `config.yaml`의 `harness.work_dir`로 바꿀 수 있습니다(`"."`로 두면 루트 전체).
 
 `--tool` 옵션 — 외부 위임 시 기본으로 쓸 도구(`config.yaml`의 `external_tools.default`)를 정합니다:
@@ -456,7 +484,7 @@ demo-agent-project/          ← 프레임워크 (바깥)
 ├── src/               # 프레임워크 공용 유틸
 ├── memory/            # 에이전트 메모리
 ├── workspace/         # ★ 수정 대상 프로젝트 (안쪽) — 에이전트는 여기만 본다
-│   └── (네가 만든 main.py, user.py 등)
+│   └── (각자 만든 main.py, user.py 등)
 └── .venv/             # 가상환경
 ```
 
@@ -491,9 +519,3 @@ demo-agent-project/          ← 프레임워크 (바깥)
 
 ---
 
-## 다음 확장 아이디어
-
-- 라우팅 결정 로그 저장 (`logs/`)
-- diff 적용 전 사용자 확인(y/n) 프롬프트
-- 벡터 DB 기반 코드 검색으로 관련 파일 탐색 정확도 향상
-- 멀티파일 변경 시 git 브랜치 자동 생성/커밋

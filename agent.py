@@ -186,11 +186,6 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
         base_url=llm_cfg["base_url"],
         temperature=llm_cfg.get("temperature", 0.2),
     )
-    router_llm = LocalLLM(
-        model=llm_cfg.get("router_model", llm_cfg["model"]),
-        base_url=llm_cfg["base_url"],
-        temperature=0.0,
-    )
 
     if not main_llm.health_check():
         log_fn("[오류] Ollama 서버에 연결할 수 없습니다. 'ollama serve'가 실행 중인지 확인하세요.")
@@ -205,8 +200,8 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
         return
 
     # 코딩 작업이 아닌 일상대화/잡담은 파이프라인 진입 전에 즉시 걸러낸다.
-    if force not in ("claude", "codex", "local") and is_chatter(router_llm, task):
-        log_fn(reply_chatter(router_llm, task))
+    if force not in ("claude", "codex", "local") and is_chatter(main_llm, task):
+        log_fn(reply_chatter(main_llm, task))
         _rec("n/a", "chatter")
         return
 
@@ -229,7 +224,7 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     if force == "local":
         decision = {"decision": "local", "reason": "사용자 지정(/model local)", "tool": None}
     else:
-        router = Router(router_llm, cfg, guide=guide)
+        router = Router(main_llm, cfg, guide=guide)
         decision = router.decide(task, len(files), est_tokens)
     log_fn(f"[2/6] 라우팅 결정: {decision}")
 

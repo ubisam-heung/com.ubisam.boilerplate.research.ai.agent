@@ -2,9 +2,8 @@
 
 local_llm:
   provider: ollama
-  base_url: "http://192.128.0.229:11345"
+  base_url: "http://192.168.0.229:11345"
   model: "qwen2.5-coder:14b"
-  router_model: "qwen2.5:3b"   # 라우팅 판단 전용(가벼운 모델). 없으면 model과 동일하게 사용
   temperature: 0.2
 
 routing:
@@ -22,9 +21,11 @@ external_tools:
   claude_code:
     command: ["claude", "-p"]          # 자동 라우팅(비대화형 1회성) 위임용
     interactive_command: ["claude"]    # /model claude 대화형 핸드오프용 (TTY 전환)
+    # model: "claude-sonnet-4-6"       # 미설정 시 claude CLI 기본값 사용
   codex:
     command: ["codex", "exec"]         # 자동 라우팅(비대화형 1회성) 위임용
     interactive_command: ["codex"]     # /model codex 대화형 핸드오프용 (TTY 전환)
+    # model: "o4-mini"                 # 미설정 시 codex CLI 기본값 사용
 
 harness:
   # 수정 대상 프로젝트 폴더. 프레임워크 파일(agent.py 등)과 분리하기 위해
@@ -44,3 +45,6 @@ harness:
 logging:
   log_dir: "logs"
   level: "INFO"
+
+sessions:
+  dir: "sessions"   # CLI 대화 세션 저장 폴더 (YYYYMMDD_HHMMSS[_태그].md)
