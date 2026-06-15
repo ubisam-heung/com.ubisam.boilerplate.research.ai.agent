@@ -3,7 +3,7 @@
 local_llm:
   provider: ollama
   base_url: "http://192.168.0.229:11345"
-  model: "qwen2.5-coder:14b"
+  model: "qwen3.5:9b-mlx"
   temperature: 0.2
 
 routing:

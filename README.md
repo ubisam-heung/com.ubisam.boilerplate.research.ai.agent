@@ -72,7 +72,8 @@ Python 버전 확인 (3.10 이상이어야 함):
 python3 --version
 ```
 
-### 1-2. Ollama 설치 및 모델 다운로드
+### 1-2. Ollama 설치 및 모델 다운로드 
+#### (선택 - 현재 조흥재 연구원의 맥북을 기반으로 설정되어있음 | "ubisam" WIFI 연결필요)
 
 **Linux / WSL Ubuntu**
 
@@ -95,11 +96,10 @@ ollama serve
 
 > `address already in use` 가 뜨면 이미 실행 중이라는 뜻이니 그대로 두면 됩니다.
 
-모델 2종을 받습니다. 메인 코딩 모델과 라우팅 판단용 경량 모델입니다:
+모델 1종을 받습니다. 메인 코딩 모델입니다:
 
 ```bash
 ollama pull qwen2.5-coder:7b   # 메인 코딩 모델
-ollama pull qwen2.5:3b         # 라우터(경량) 모델
 ```
 
 > **메모리 권장**: 7B Q4 모델 기준 RAM 16GB 이상을 권장합니다. 사양이 낮으면
@@ -111,7 +111,7 @@ ollama pull qwen2.5:3b         # 라우터(경량) 모델
 curl http://localhost:11434/api/tags
 ```
 
-### 1-3. (선택) 외부 도구 — Claude Code / Codex CLI
+### 1-3. 외부 도구 — Claude Code / Codex CLI
 
 `auto` 라우팅에서 큰 작업이 외부로 위임되거나, `/model claude` · `/model codex`를
 쓰려면 해당 CLI가 PATH에 있어야 합니다. 로컬(`local`)만 쓸 거라면 건너뛰어도 됩니다.
