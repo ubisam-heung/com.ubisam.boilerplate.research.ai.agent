@@ -21,11 +21,11 @@ external_tools:
   claude_code:
     command: ["claude", "-p"]          # 자동 라우팅(비대화형 1회성) 위임용
     interactive_command: ["claude"]    # /model claude 대화형 핸드오프용 (TTY 전환)
-    # model: "claude-sonnet-4-6"       # 미설정 시 claude CLI 기본값 사용
+    model: "claude-sonnet-4-6"       # 미설정 시 claude CLI 기본값 사용
   codex:
     command: ["codex", "exec"]         # 자동 라우팅(비대화형 1회성) 위임용
     interactive_command: ["codex"]     # /model codex 대화형 핸드오프용 (TTY 전환)
-    # model: "o4-mini"                 # 미설정 시 codex CLI 기본값 사용
+    model: "o4-mini"                 # 미설정 시 codex CLI 기본값 사용
 
 harness:
   # 수정 대상 프로젝트 폴더. 프레임워크 파일(agent.py 등)과 분리하기 위해

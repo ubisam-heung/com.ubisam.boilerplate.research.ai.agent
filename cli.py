@@ -5,8 +5,11 @@ Usage:
     python cli.py              # 대화형 모드
     python cli.py "작업 설명"   # 단일 작업 실행
 """
+import json
 import os
+import pty
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -52,16 +55,57 @@ _MODEL_ALIASES = {"claude_code": "claude", "claudecode": "claude"}
 BARE_COMMANDS = {"help", "model", "status", "config", "history", "clear", "metrics", "save", "exit", "quit", "q"}
 
 
+# ANSI 이스케이프(컬러/커서 이동 등) 제거용 — 캡처한 출력을 가볍게 저장하기 위해 사용.
+_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?(?:\x07|\x1b\\)")
+_MAX_TAIL_CHARS = 4000  # 외부 도구 출력은 이만큼만 보관(이어하기용 요약 목적, 전체 로그 아님)
+
+
+def run_with_capture(cmd: List[str], cwd: str, max_tail: int = _MAX_TAIL_CHARS) -> tuple:
+    """claude/codex를 진짜 pty에 붙여 실행한다.
+
+    pty.spawn은 자식에 실제 TTY를 주기 때문에 권한 승인 UI·컬러·대화 연속성이 네이티브와
+    동일하게 동작한다. 그 와중에 master_read 콜백으로 흘러가는 바이트를 옆에서 캡(4*max_tail)
+    버퍼에만 누적해 두므로, 디스크에 풀 로그를 쌓지 않고도 마지막 출력 일부를 건질 수 있다.
+    """
+    tail = bytearray()
+
+    def _master_read(fd: int) -> bytes:
+        data = os.read(fd, 1024)
+        if data:
+            tail.extend(data)
+            overflow = len(tail) - max_tail * 4
+            if overflow > 0:
+                del tail[:overflow]
+        return data
+
+    prev_cwd = os.getcwd()
+    os.chdir(cwd)
+    try:
+        status = pty.spawn(cmd, _master_read)
+    finally:
+        os.chdir(prev_cwd)
+
+    exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else status
+    clean = _ANSI_RE.sub(b"", bytes(tail)).decode("utf-8", errors="replace")
+    return exit_code, clean.strip()[-max_tail:]
+
+
 class SessionRecorder:
-    """CLI 대화 세션(입력 + 출력)을 기록하고 마크다운 파일로 저장한다."""
+    """CLI 대화 세션(입력 + 출력)을 기록하고 JSON 파일로 저장한다.
+
+    status: "active"  — 진행 중 / 비정상 종료 가능성 있음(다음 실행 시 이걸로 크래시를 감지)
+            "ended"    — /exit 등으로 정상 종료
+    """
 
     def __init__(self, sessions_dir: str):
         self.sessions_dir = Path(sessions_dir)
         self.started_at = datetime.now()
+        self.session_id = self.started_at.strftime("%Y%m%d_%H%M%S")
         self.turns: List[dict] = []
         self._buf: List[str] = []
         self._cur_input: Optional[str] = None
         self._cur_model: str = "auto"
+        self._path: Optional[Path] = None
 
     def start_turn(self, user_input: str, model: str):
         self._cur_input = user_input
@@ -72,49 +116,79 @@ class SessionRecorder:
         if self._cur_input is not None:
             self._buf.append(line)
 
-    def end_turn(self, interactive: bool = False):
+    def last_turn(self) -> Optional[dict]:
+        return self.turns[-1] if self.turns else None
+
+    def end_turn(self, interactive: bool = False, tail: str = ""):
         if self._cur_input is None:
             return
         self.turns.append({
             "ts": datetime.now().strftime("%H:%M:%S"),
             "model": self._cur_model,
             "input": self._cur_input,
-            "output": ("(대화형 세션 — TTY 직접 연결, 출력 캡처 불가)"
-                       if interactive else "\n".join(self._buf)),
+            "output": (tail if interactive else "\n".join(self._buf))[-_MAX_TAIL_CHARS:],
             "interactive": interactive,
         })
         self._cur_input = None
         self._buf = []
 
-    def save(self, tag: str = "") -> Optional[Path]:
+    def save(self, tag: str = "", status: str = "active") -> Optional[Path]:
         if not self.turns:
             return None
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        ts = self.started_at.strftime("%Y%m%d_%H%M%S")
-        suffix = f"_{tag}" if tag else ""
-        path = self.sessions_dir / f"{ts}{suffix}.md"
+        if self._path is None:
+            suffix = f"_{tag}" if tag else ""
+            self._path = self.sessions_dir / f"{self.session_id}{suffix}.json"
+        data = {
+            "session_id": self.session_id,
+            "started_at": self.started_at.isoformat(),
+            "status": status,
+            "turns": self.turns,
+        }
+        self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return self._path
 
-        lines = [
-            f"# AI Agent 세션  {self.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
-            "",
-        ]
-        for i, t in enumerate(self.turns, 1):
-            lines += [
-                f"## [{i}] {t['ts']}  `{t['model']}`",
-                "",
-                "**입력**",
-                "",
-                f"> {t['input']}",
-                "",
-                "**출력**",
-                "",
-                "```",
-                t["output"],
-                "```",
-                "",
-            ]
-        path.write_text("\n".join(lines), encoding="utf-8")
-        return path
+    @staticmethod
+    def find_crashed(sessions_dir: str) -> Optional[dict]:
+        """status가 'active'로 남아있는(=정상 종료 못 한) 가장 최근 세션을 찾는다."""
+        d = Path(sessions_dir)
+        if not d.exists():
+            return None
+        candidates = []
+        for p in d.glob("*.json"):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("status") == "active" and data.get("turns"):
+                candidates.append((p, data))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda pd: pd[1].get("started_at", ""))
+        path, data = candidates[-1]
+        return {"path": path, "data": data}
+
+    @staticmethod
+    def mark_resolved(path: Path, status: str):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["status"] = status
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+
+def build_resume_preamble(turn: dict) -> str:
+    """이전 세션(혹은 다른 도구로의 핸드오프 직전) 마지막 턴을 짧은 프리앰블로 변환.
+
+    풀 프로젝트 재탐색 대신 '어디까지 했는지'를 먼저 알려줘서 탐색 비용을 줄이는 목적.
+    """
+    return (
+        "[이어하기 — 처음부터 다시 탐색하지 말고 아래를 참고해서 이어서 진행해줘]\n"
+        f"이전 작업({turn.get('model', '?')}): {turn.get('input', '')}\n"
+        f"이전 출력 일부:\n{turn.get('output', '')[-1500:]}\n"
+        "---\n\n"
+    )
 
 _BANNER = """\
 [bold blue] ╔══════════════════════════════════════╗[/bold blue]
@@ -296,6 +370,25 @@ def run_interactive(project_dir: str = "."):
 
     history: List[str] = []
     ui = {"model": "auto"}
+    pending_preamble = {"text": ""}
+
+    crashed = SessionRecorder.find_crashed(sessions_dir)
+    if crashed:
+        last = crashed["data"]["turns"][-1]
+        console.print(
+            Panel(
+                f"[dim]마지막 작업[/dim] ({escape(last.get('model', '?'))}): "
+                f"{escape(last.get('input', '')[:200])}",
+                title="[bold yellow]이전 세션이 비정상 종료된 것 같습니다[/bold yellow]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
+        if _rich_confirm("이어서 진행할까요? (다음 작업에 이전 내용을 요약해 전달합니다)"):
+            pending_preamble["text"] = build_resume_preamble(last)
+            SessionRecorder.mark_resolved(crashed["path"], "resumed")
+        else:
+            SessionRecorder.mark_resolved(crashed["path"], "abandoned")
 
     while True:
         try:
@@ -327,8 +420,10 @@ def run_interactive(project_dir: str = "."):
 
         if ui["model"] in ("claude", "codex"):
             # 명시적 외부 모델: 대화형 세션으로 전환 후 즉시 저장
-            _run_external_interactive(ui["model"], task, _work_root(project_dir, config), config)
-            recorder.end_turn(interactive=True)
+            preamble = _next_preamble(pending_preamble, recorder, ui["model"])
+            tail = _run_external_interactive(ui["model"], task, _work_root(project_dir, config), config,
+                                              resume_preamble=preamble)
+            recorder.end_turn(interactive=True, tail=tail)
             _autosave(recorder)
         elif ui["model"] == "local":
             # 로컬 강제: 기존 파이프라인 실행
@@ -339,10 +434,10 @@ def run_interactive(project_dir: str = "."):
             recorder.end_turn()
         else:
             # auto: 잡담은 로컬, 코딩은 외부 대화형 세션으로 직행
-            _run_auto_mode(task, project_dir, config, recorder)
+            _run_auto_mode(task, project_dir, config, recorder, pending_preamble)
 
     # 세션 종료 시 자동 저장
-    saved = recorder.save()
+    saved = recorder.save(status="ended")
     if saved:
         console.print(f"  [dim]세션 자동 저장됨: {escape(str(saved))}[/dim]")
 
@@ -454,11 +549,26 @@ def _work_root(project_dir: str, config: dict) -> str:
     return os.path.normpath(os.path.join(project_dir, work_dir))
 
 
-def _run_external_interactive(model: str, task: str, work_root: str, config: dict):
+def _next_preamble(pending_preamble: dict, recorder: "SessionRecorder", next_model: str) -> str:
+    """크래시 복구 프리앰블 또는(없으면) 같은 세션 내 도구 전환(claude<->codex) 핸드오프 프리앰블.
+
+    한 번 쓰면 비워서 매 턴마다 반복 주입되지 않게 한다.
+    """
+    preamble = pending_preamble["text"]
+    pending_preamble["text"] = ""
+    if preamble:
+        return preamble
+    last = recorder.last_turn()
+    if last and last.get("interactive") and last.get("model") in ("claude", "codex") and last.get("model") != next_model:
+        return build_resume_preamble(last)
+    return ""
+
+
+def _run_external_interactive(model: str, task: str, work_root: str, config: dict, resume_preamble: str = "") -> str:
     """진짜 claude/codex 대화형 세션으로 현재 터미널을 넘긴다(핸드오프).
 
-    출력을 캡처하지 않고 TTY를 그대로 물려줘서 권한 승인·대화 연속성이 네이티브로 동작한다.
-    세션을 종료하면(exit / Ctrl-D) agent 루프로 복귀한다.
+    pty로 실행해 권한 승인·대화 연속성은 네이티브로 동작시키면서, 마지막 출력 일부만 가볍게
+    캡처해 반환한다(세션 기록·이어하기용). 세션을 종료하면(exit / Ctrl-D) agent 루프로 복귀한다.
     """
     tool_key = "codex" if model == "codex" else "claude_code"
     ext = config.get("external_tools", {}).get(tool_key, {})
@@ -466,11 +576,21 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
     cmd = list(base)
     if model_override := ext.get("model"):
         cmd += ["--model", model_override]
-    cmd += [task] if task else []
+    full_task = (resume_preamble + task) if resume_preamble else task
+    cmd += [full_task] if full_task else []
+
+    if shutil.which(cmd[0]) is None:
+        console.print(
+            f"  [bold red]오류:[/bold red]  {model} CLI를 찾을 수 없습니다. "
+            f"설치 및 PATH 등록을 확인하세요."
+        )
+        return ""
 
     os.makedirs(work_root, exist_ok=True)
     console.print()
     console.print(Rule(f"[dim]{model} 대화형 세션[/dim]", style="dim blue"))
+    if resume_preamble:
+        console.print("  [dim]이전 내용 요약을 전달해 이어서 진행합니다.[/dim]")
     console.print(
         f"  [dim]진짜 {model} 세션으로 전환합니다. "
         f"끝내려면 {model}에서 종료(exit · Ctrl-D)하면 agent로 돌아옵니다.[/dim]"
@@ -478,13 +598,9 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
     console.print(f"  [dim]작업 폴더: {escape(work_root)}[/dim]\n")
 
     t0 = time.monotonic()
+    tail = ""
     try:
-        subprocess.run(cmd, cwd=work_root)
-    except FileNotFoundError:
-        console.print(
-            f"  [bold red]오류:[/bold red]  {model} CLI를 찾을 수 없습니다. "
-            f"설치 및 PATH 등록을 확인하세요."
-        )
+        _, tail = run_with_capture(cmd, work_root)
     except KeyboardInterrupt:
         pass
 
@@ -497,6 +613,7 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
     console.print()
     console.print(Rule(f"[dim]{model} 세션 종료 — agent로 복귀[/dim]", style="dim"))
     console.print()
+    return tail
 
 
 def _run_task(task: str, project_dir: str, model: str = "auto", log_fn=None):
@@ -543,16 +660,19 @@ def _is_obviously_coding(task: str) -> bool:
     return any(sig in task or sig in tl for sig in _CODING_SIGNALS)
 
 
-def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionRecorder):
+def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionRecorder,
+                    pending_preamble: Optional[dict] = None):
     """auto 모드: 명백한 코딩은 즉시 외부 위임, 애매하면 LLM 1회로 잡담/코딩 판단."""
     ext_default = config.get("external_tools", {}).get("default", "claude_code")
     model = "claude" if ext_default == "claude_code" else ext_default
     work_root = _work_root(project_dir, config)
+    pending_preamble = pending_preamble if pending_preamble is not None else {"text": ""}
 
     # 명백한 코딩 신호가 있으면 LLM 호출 없이 즉시 외부로
     if _is_obviously_coding(task):
-        _run_external_interactive(model, task, work_root, config)
-        recorder.end_turn(interactive=True)
+        preamble = _next_preamble(pending_preamble, recorder, model)
+        tail = _run_external_interactive(model, task, work_root, config, resume_preamble=preamble)
+        recorder.end_turn(interactive=True, tail=tail)
         _autosave(recorder)
         return
 
@@ -580,8 +700,9 @@ def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionR
         return
 
     # 잡담 아닌 것으로 판단(또는 Ollama 없음) → 외부 위임
-    _run_external_interactive(model, task, work_root, config)
-    recorder.end_turn(interactive=True)
+    preamble = _next_preamble(pending_preamble, recorder, model)
+    tail = _run_external_interactive(model, task, work_root, config, resume_preamble=preamble)
+    recorder.end_turn(interactive=True, tail=tail)
     _autosave(recorder)
 
 
