@@ -111,10 +111,15 @@ ollama pull qwen2.5-coder:7b   # 메인 코딩 모델
 curl http://localhost:11434/api/tags
 ```
 
-### 1-3. 외부 도구 — Claude Code / Codex CLI
+### 1-3. 외부 도구 — Claude Code / Codex CLI (필수)
 
 `auto` 라우팅에서 큰 작업이 외부로 위임되거나, `/model claude` · `/model codex`를
 쓰려면 해당 CLI가 PATH에 있어야 합니다. 로컬(`local`)만 쓸 거라면 건너뛰어도 됩니다.
+
+**Home Directory 이동** 
+```bash
+cd ~
+```
 
 **Codex CLI** (Node.js LTS 필요):
 
@@ -162,10 +167,12 @@ codex
 
 저장소를 클론하고 `install.sh`로 **대상 프로젝트 디렉토리**에 프레임워크를 설치합니다.
 대상 경로는 혼동을 막기 위해 절대경로 또는 `~/...` 형태를 권장합니다.
+예시로 demo-agent-project 를 만듭니다.
 
 ```bash
+cd ~
 git clone <이 저장소 URL>
-cd ai-agent
+cd com.ubisam.boilerplate.research.ai.agent
 
 ./install.sh --target ~/demo-agent-project --tool all
 ```
@@ -206,7 +213,31 @@ cd ai-agent
 
 ---
 
-## 3. 설치 점검 (doctor.sh)
+## 3. 업데이트 (update.sh)
+
+이미 설치한 프로젝트에 프레임워크 코드만 최신 버전으로 다시 덮어씁니다. 처음 설치할 때는
+`install.sh`를, 이미 설치된 프로젝트의 코드를 갱신할 때는 `update.sh`를 씁니다.
+
+```bash
+cd ~/com.ubisam.boilerplate.research.ai.agent
+./update.sh --target ~/demo-agent-project
+```
+
+`update.sh`가 덮어쓰는 것:
+
+- `agent.py`, `cli.py`, `router.py`, `metrics.py`, `conftest.py`, `doctor.sh`, `requirements.txt`
+- `backends/`, `harness/`, `src/`
+
+**건드리지 않는 것** — 프로젝트별 상태/설정은 그대로 유지됩니다:
+
+- `config.yaml`, `AGENTS.md`
+- `memory/`, `sessions/`, `workspace/`, `.env`
+
+`requirements.txt`가 갱신되므로, 대상에 `.venv`가 있으면 의존성도 자동으로 동기화합니다.
+
+---
+
+## 4. 설치 점검 (doctor.sh)
 
 설치한 프로젝트 상태를 진단합니다. Python·가상환경·파일 구조·패키지·Ollama·모델 연결을 한 번에 확인합니다.
 
@@ -225,7 +256,7 @@ cd ~/demo-agent-project
 
 ---
 
-## 4. 실행
+## 5. 실행
 
 Ollama가 실행 중인 상태에서, 설치한 프로젝트 디렉토리로 이동해 `./agent`를 실행합니다.
 수정할 코드는 미리 `workspace/`에 넣어 둡니다.
@@ -284,7 +315,7 @@ agent (local) ❯ Calculator/main.py가 무슨 코드인지 설명해줘
 
 ---
 
-## 5. 실행 모델 선택 (/model)
+## 6. 실행 모델 선택 (/model)
 
 대화형 모드에서 작업을 어떤 백엔드로 처리할지 직접 고를 수 있습니다.
 선택한 모델은 프롬프트에 `agent (claude) ❯` 처럼 표시됩니다.
@@ -329,7 +360,7 @@ agent (claude) ❯
 
 ---
 
-## 5-1. 작업 지표 (metrics)
+## 6-1. 작업 지표 (metrics)
 
 매 작업 실행이 `logs/metrics.jsonl`에 자동 기록됩니다. 누적된 지표는 다음으로 확인합니다:
 
@@ -357,7 +388,7 @@ AI Agent 작업 지표 (기대효과 정량화)
 
 ---
 
-## 6. 설정 (config.yaml)
+## 7. 설정 (config.yaml)
 
 설치된 프로젝트의 `config.yaml` 한 곳에서 모든 동작을 조정합니다.
 
@@ -381,7 +412,7 @@ AI Agent 작업 지표 (기대효과 정량화)
 
 ---
 
-## 7. 가드레일 / 안전장치
+## 8. 가드레일 / 안전장치
 
 작업 전·중·후에 다음 보호 장치가 동작합니다. 행동 규칙 전문은 [AGENTS.md](AGENTS.md) 참고.
 
@@ -465,7 +496,7 @@ args = ["-y", "@playwright/mcp@latest"]
 
 ---
 
-## 8. 디렉토리 구조
+## 9. 디렉토리 구조
 
 설치된 프로젝트는 대략 다음과 같이 구성됩니다.
 
@@ -495,7 +526,7 @@ demo-agent-project/          ← 프레임워크 (바깥)
 
 ---
 
-## 9. 동작 확인 체크리스트
+## 10. 동작 확인 체크리스트
 
 1. `ollama serve` (또는 macOS `brew services list`)로 Ollama 실행 확인
 2. `curl http://localhost:11434/api/tags` 로 모델 목록 확인
@@ -506,7 +537,7 @@ demo-agent-project/          ← 프레임워크 (바깥)
 
 ---
 
-## 10. 문제 해결
+## 11. 문제 해결
 
 | 증상 | 원인 / 해결 |
 |---|---|
