@@ -1,10 +1,18 @@
 # ai-agent 설정 파일
 
 local_llm:
+  enabled: true
   provider: ollama
   base_url: "http://192.168.0.229:11345"
   model: "qwen3.5:9b-mlx"
   temperature: 0.7
+
+openrouter:
+  enabled: false   # 아직 미적용. true로 바꾸기 전엔 코드에서 사용되지 않음
+  base_url: "https://openrouter.ai/api/v1"
+  api_key: ""      # 비워두면 OPENROUTER_API_KEY 환경변수 사용
+  model: "anthropic/claude-3.5-sonnet"
+  temperature: 0.2
 
 routing:
   # 1차 규칙 기반 필터 임계값
@@ -19,10 +27,12 @@ routing:
 external_tools:
   default: claude_code   # local 판단 실패 시 기본 사용 도구: claude_code | codex
   claude_code:
+    enabled: true
     command: ["claude", "-p"]          # 자동 라우팅(비대화형 1회성) 위임용
     interactive_command: ["claude"]    # /model claude 대화형 핸드오프용 (TTY 전환)
     model: "claude-sonnet-4-6"       # 미설정 시 claude CLI 기본값 사용
   codex:
+    enabled: true
     command: ["codex", "exec"]         # 자동 라우팅(비대화형 1회성) 위임용
     interactive_command: ["codex"]     # /model codex 대화형 핸드오프용 (TTY 전환)
     model: "o4-mini"                 # 미설정 시 codex CLI 기본값 사용

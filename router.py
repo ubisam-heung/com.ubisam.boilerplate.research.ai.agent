@@ -50,6 +50,33 @@ JSON 형식 (이 형식 그대로):
 """
 
 
+def tool_enabled(cfg: dict, tool: str) -> bool:
+    """external_tools.<tool>.enabled (기본 true)."""
+    return cfg.get("external_tools", {}).get(tool, {}).get("enabled", True)
+
+
+def pick_external_tool(cfg: dict, preferred: str | None = None) -> str | None:
+    """활성화된(enabled) 외부 도구 하나를 고른다.
+
+    preferred -> external_tools.default -> 나머지 등록된 도구 순으로 시도하고,
+    활성화된 도구가 하나도 없으면 None을 반환한다.
+    """
+    ext = cfg.get("external_tools", {})
+    order = []
+    if preferred:
+        order.append(preferred)
+    default = ext.get("default", "claude_code")
+    if default not in order:
+        order.append(default)
+    for name in ("claude_code", "codex"):
+        if name not in order:
+            order.append(name)
+    for name in order:
+        if tool_enabled(cfg, name):
+            return name
+    return None
+
+
 def pre_filter(task: str, file_count: int, est_tokens: int, cfg: dict) -> str | None:
     """규칙 기반 1차 필터. 명확한 경우 LLM 호출 없이 즉시 결정."""
     routing_cfg = cfg.get("routing", {})
@@ -77,7 +104,7 @@ class Router:
         if pre == "local":
             return {"decision": "local", "reason": "규칙 기반: 작고 명확한 작업", "tool": None}
         if pre == "external":
-            default_tool = self.cfg.get("external_tools", {}).get("default", "claude_code")
+            default_tool = pick_external_tool(self.cfg)
             return {"decision": "external", "reason": "규칙 기반: 큰 작업/키워드 매칭", "tool": default_tool}
 
         # 애매한 경우 LLM 판단
@@ -89,11 +116,14 @@ class Router:
             result = self.llm.generate(prompt, json_mode=True)
         except Exception:
             # 실패 시 안전하게 외부로
-            default_tool = self.cfg.get("external_tools", {}).get("default", "claude_code")
+            default_tool = pick_external_tool(self.cfg)
             return {"decision": "external", "reason": "라우팅 LLM 호출 실패, 안전하게 외부 도구 사용", "tool": default_tool}
 
         if result.get("decision") not in ("local", "external"):
-            default_tool = self.cfg.get("external_tools", {}).get("default", "claude_code")
+            default_tool = pick_external_tool(self.cfg)
             return {"decision": "external", "reason": "라우팅 응답 형식 오류, 안전하게 외부 도구 사용", "tool": default_tool}
 
+        if result["decision"] == "external":
+            # LLM이 비활성화된 도구를 골랐을 수 있으니 활성화된 도구로 보정
+            result["tool"] = pick_external_tool(self.cfg, preferred=result.get("tool"))
         return result

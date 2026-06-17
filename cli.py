@@ -300,11 +300,18 @@ def _load_config(project_dir: str = ".") -> dict:
 
 
 def _check_status(config: dict, project_dir: str) -> dict:
+    from router import tool_enabled
+
     status = {
         "ollama": False,
         "model": "—",
         "project_dir": project_dir,
+        "local_enabled": config.get("local_llm", {}).get("enabled", True),
+        "claude_enabled": tool_enabled(config, "claude_code"),
+        "codex_enabled": tool_enabled(config, "codex"),
     }
+    if not status["local_enabled"]:
+        return status
     try:
         import requests
         llm = config.get("local_llm", {})
@@ -334,12 +341,18 @@ def _print_status(status: dict):
     dot_err = "[red]●[/red]"
     dot_dim = "[dim]●[/dim]"
 
-    if status["ollama"]:
+    if not status.get("local_enabled", True):
+        t.add_row(dot_dim, "Ollama", "[dim]비활성화 (local_llm.enabled: false)[/dim]")
+    elif status["ollama"]:
         t.add_row(dot_ok, "Ollama", "[green]연결됨[/green]")
         t.add_row(dot_ok, "모델", f"[cyan]{escape(status['model'])}[/cyan]")
     else:
         t.add_row(dot_err, "Ollama", "[red]연결 안 됨[/red]  →  ollama serve")
 
+    t.add_row(dot_ok if status.get("claude_enabled") else dot_dim, "claude",
+              "[green]활성화[/green]" if status.get("claude_enabled") else "[dim]비활성화[/dim]")
+    t.add_row(dot_ok if status.get("codex_enabled") else dot_dim, "codex",
+              "[green]활성화[/green]" if status.get("codex_enabled") else "[dim]비활성화[/dim]")
     t.add_row(dot_dim, "프로젝트", f"[dim]{escape(status['project_dir'])}[/dim]")
     console.print(t)
 
@@ -355,7 +368,7 @@ def run_interactive(project_dir: str = "."):
 
     _print_status(status)
 
-    if not status["ollama"]:
+    if status.get("local_enabled", True) and not status["ollama"]:
         console.print(
             "\n  [yellow]⚠[/yellow]  Ollama가 실행되지 않았습니다. "
             "[dim]ollama serve[/dim] 를 먼저 실행하세요.\n"
@@ -479,6 +492,11 @@ def _handle_command(
                     f"  [yellow]알 수 없는 모델:[/yellow] {escape(parts[1])}"
                     f"  [dim]— {', '.join(MODELS)}[/dim]"
                 )
+            elif not _model_enabled(config, choice):
+                console.print(
+                    f"  [yellow]{escape(choice)}는 config.yaml에서 비활성화되어 있습니다.[/yellow]"
+                    f"  [dim](enabled: false)[/dim]"
+                )
             else:
                 ui["model"] = choice
                 console.print(
@@ -541,6 +559,16 @@ def _handle_command(
 
     else:
         console.print(f"  [yellow]알 수 없는 명령어:[/yellow] {escape(raw)}  [dim]— /help 참고[/dim]")
+
+
+def _model_enabled(config: dict, model: str) -> bool:
+    """auto는 항상 허용. local/claude/codex는 config.yaml의 enabled 플래그를 따른다."""
+    if model in ("auto",):
+        return True
+    if model == "local":
+        return config.get("local_llm", {}).get("enabled", True)
+    tool_key = "codex" if model == "codex" else "claude_code"
+    return config.get("external_tools", {}).get(tool_key, {}).get("enabled", True)
 
 
 def _work_root(project_dir: str, config: dict) -> str:
@@ -663,10 +691,17 @@ def _is_obviously_coding(task: str) -> bool:
 def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionRecorder,
                     pending_preamble: Optional[dict] = None):
     """auto 모드: 명백한 코딩은 즉시 외부 위임, 애매하면 LLM 1회로 잡담/코딩 판단."""
-    ext_default = config.get("external_tools", {}).get("default", "claude_code")
-    model = "claude" if ext_default == "claude_code" else ext_default
+    from router import pick_external_tool
+
+    model = pick_external_tool(config)
     work_root = _work_root(project_dir, config)
     pending_preamble = pending_preamble if pending_preamble is not None else {"text": ""}
+
+    if model is None:
+        console.print("  [bold red]오류:[/bold red]  활성화된 외부 도구가 없습니다 (claude_code/codex 모두 비활성화).")
+        recorder.append("[오류] 활성화된 외부 도구 없음")
+        recorder.end_turn()
+        return
 
     # 명백한 코딩 신호가 있으면 LLM 호출 없이 즉시 외부로
     if _is_obviously_coding(task):
@@ -676,21 +711,17 @@ def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionR
         _autosave(recorder)
         return
 
-    # 애매한 경우: LLM 1회로 잡담 여부만 판단
-    from backends.local_llm import LocalLLM
+    # 애매한 경우: 파이프라인 백엔드(local_llm/openrouter)가 켜져 있으면 1회 호출로 잡담 여부만 판단
+    from agent import _build_main_llm
+    llm = _build_main_llm(config)
+    ollama_ok = False
+    if llm is not None:
+        try:
+            ollama_ok = llm.health_check()
+        except Exception:
+            ollama_ok = False
+
     from router import is_chatter, reply_chatter
-
-    llm_cfg = config.get("local_llm", {})
-    llm = LocalLLM(
-        model=llm_cfg.get("model", ""),
-        base_url=llm_cfg.get("base_url", ""),
-        temperature=0.0,
-    )
-
-    try:
-        ollama_ok = llm.health_check()
-    except Exception:
-        ollama_ok = False
 
     if ollama_ok and is_chatter(llm, task):
         reply = reply_chatter(llm, task)

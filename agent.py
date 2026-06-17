@@ -9,9 +9,34 @@ import time
 import yaml
 
 from backends.local_llm import LocalLLM
+from backends.openrouter import OpenRouterLLM
 from backends import claude_code_cli, codex_cli
-from router import Router, is_chatter, reply_chatter
+from router import Router, is_chatter, reply_chatter, pick_external_tool, tool_enabled
 from harness import context, planner, executor, verifier, recovery, hooks, metrics, project_guide
+
+
+def _build_main_llm(cfg: dict):
+    """파이프라인(파일선택/계획/라우팅/잡담판단)에 쓸 메인 LLM을 고른다.
+
+    local_llm이 켜져 있으면 그걸 쓰고, 꺼져 있으면 openrouter를 시도한다.
+    둘 다 꺼져 있으면 None(호출 측에서 외부 도구로 위임).
+    """
+    llm_cfg = cfg.get("local_llm", {})
+    if llm_cfg.get("enabled", True):
+        return LocalLLM(
+            model=llm_cfg["model"],
+            base_url=llm_cfg["base_url"],
+            temperature=llm_cfg.get("temperature", 0.2),
+        )
+    or_cfg = cfg.get("openrouter", {})
+    if or_cfg.get("enabled", False):
+        return OpenRouterLLM(
+            model=or_cfg.get("model", ""),
+            api_key=or_cfg.get("api_key", ""),
+            base_url=or_cfg.get("base_url", "https://openrouter.ai/api/v1"),
+            temperature=or_cfg.get("temperature", 0.2),
+        )
+    return None
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -141,7 +166,6 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
 
     t0 = time.monotonic()
     cfg = load_config()
-    llm_cfg = cfg["local_llm"]
     log_dir = cfg.get("logging", {}).get("log_dir", "logs")
 
     def _rec(decision, outcome, **extra):
@@ -175,20 +199,43 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     # 사용자가 외부 도구를 강제 지정한 경우: Ollama 없이 바로 위임한다.
     if force in ("claude", "codex"):
         tool = "codex" if force == "codex" else "claude_code"
+        if not tool_enabled(cfg, tool):
+            log_fn(f"[오류] {tool}가 config.yaml에서 비활성화되어 있습니다 (external_tools.{tool}.enabled: false).")
+            _rec("n/a", "tool_disabled", tool=tool)
+            return
         log_fn(f"[1/2] 작업: {task}")
         log_fn(f"[2/2] 외부 도구로 위임 (사용자 지정): {tool}")
         _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
         _rec("external", "forced_external", tool=tool)
         return
 
-    main_llm = LocalLLM(
-        model=llm_cfg["model"],
-        base_url=llm_cfg["base_url"],
-        temperature=llm_cfg.get("temperature", 0.2),
-    )
+    main_llm = _build_main_llm(cfg)
+
+    if force == "local" and main_llm is None:
+        log_fn("[오류] local_llm과 openrouter가 모두 비활성화되어 있습니다. "
+               "config.yaml에서 둘 중 하나는 enabled: true로 설정하세요.")
+        _rec("n/a", "local_disabled")
+        return
+
+    # 파이프라인 백엔드(local_llm/openrouter)가 모두 비활성화된 경우: 바로 외부로 위임한다.
+    if main_llm is None:
+        tool = pick_external_tool(cfg)
+        if tool is None:
+            log_fn("[오류] local_llm/openrouter/외부 도구가 모두 비활성화되어 있습니다. "
+                   "config.yaml에서 최소 하나는 enabled: true로 설정하세요.")
+            _rec("n/a", "no_enabled_backend")
+            return
+        log_fn(f"[1/2] 작업: {task}")
+        log_fn(f"[2/2] 파이프라인 백엔드 비활성화 → 외부 도구로 위임: {tool}")
+        _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
+        _rec("external", "local_disabled_external", tool=tool)
+        return
 
     if not main_llm.health_check():
-        log_fn("[오류] Ollama 서버에 연결할 수 없습니다. 'ollama serve'가 실행 중인지 확인하세요.")
+        if isinstance(main_llm, OpenRouterLLM):
+            log_fn("[오류] OpenRouter에 연결할 수 없습니다. config.yaml의 openrouter.api_key를 확인하세요.")
+        else:
+            log_fn("[오류] Ollama 서버에 연결할 수 없습니다. 'ollama serve'가 실행 중인지 확인하세요.")
         return
 
     exclude_dirs = cfg["harness"]["exclude_dirs"]
@@ -229,7 +276,11 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     log_fn(f"[2/6] 라우팅 결정: {decision}")
 
     if decision["decision"] == "external":
-        tool = decision.get("tool") or cfg["external_tools"]["default"]
+        tool = decision.get("tool") or pick_external_tool(cfg)
+        if tool is None:
+            log_fn("[오류] 활성화된 외부 도구가 없습니다. config.yaml의 external_tools에서 하나를 enabled: true로 설정하세요.")
+            _rec("n/a", "no_enabled_tool", est_tokens=est_tokens, files=len(files))
+            return
         log_fn(f"[2/6] 외부 도구로 위임: {tool}")
         _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
         _rec("external", "auto_external", tool=tool, est_tokens=est_tokens, files=len(files))
@@ -253,7 +304,11 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
 
     # 살릴 변경이 하나도 없으면 로컬은 신뢰 불가 → 외부 도구로 자동 폴백.
     if not plan["changes"]:
-        tool = cfg["external_tools"]["default"]
+        tool = pick_external_tool(cfg)
+        if tool is None:
+            log_fn("[안내] 수행할 변경 사항이 없고, 활성화된 외부 도구도 없습니다.")
+            _rec("n/a", "no_changes_no_tool", est_tokens=est_tokens, files=len(files))
+            return
         log_fn(f"[폴백] 로컬 계획이 유효한 변경을 만들지 못해 외부 도구로 위임: {tool}")
         _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
         _rec("external", "local_fallback", tool=tool, est_tokens=est_tokens, files=len(files))
@@ -262,7 +317,11 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     # 작업이 파일명을 콕 집었는데 계획이 그 파일을 안 건드리면 탈선 → 외부 폴백.
     missing = planner.untouched_targets(task, files, plan["changes"])
     if missing:
-        tool = cfg["external_tools"]["default"]
+        tool = pick_external_tool(cfg)
+        if tool is None:
+            log_fn(f"[안내] 작업이 지정한 파일을 계획이 건드리지 않았고({missing}), 활성화된 외부 도구도 없습니다.")
+            _rec("n/a", "offtarget_no_tool", est_tokens=est_tokens, files=len(files))
+            return
         log_fn(f"[폴백] 작업이 지정한 파일을 계획이 건드리지 않음({missing}) → 외부 도구로 위임: {tool}")
         _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
         _rec("external", "local_offtarget", tool=tool, est_tokens=est_tokens, files=len(files))
