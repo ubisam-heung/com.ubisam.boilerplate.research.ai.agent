@@ -394,14 +394,21 @@ AI Agent 작업 지표 (기대효과 정량화)
 
 | 키 | 설명 |
 |---|---|
+| `local_llm.enabled` | local_llm(Ollama) 백엔드 사용 여부 (기본 `true`) |
 | `local_llm.model` | 메인 코딩 모델 (기본 `qwen2.5-coder:7b`) |
 | `local_llm.router_model` | 라우팅 판단용 경량 모델 (기본 `qwen2.5:3b`) |
 | `local_llm.base_url` | Ollama 주소 (기본 `http://localhost:11434`) |
+| `openrouter.enabled` | OpenRouter를 메인 백엔드로 사용 여부 (기본 `false`) |
+| `openrouter.api_key` | OpenRouter API 키 (비워두면 `OPENROUTER_API_KEY` 환경변수 사용) |
+| `openrouter.model` | 사용할 모델 ID (예: `anthropic/claude-3.5-sonnet`) |
+| `openrouter.base_url` | OpenRouter API 주소 (기본 `https://openrouter.ai/api/v1`) |
 | `routing.max_local_files` | 이 파일 수를 넘으면 외부로 라우팅 |
 | `routing.max_local_tokens` | 이 토큰 수를 넘으면 외부로 라우팅 |
 | `routing.force_external_keywords` | 포함 시 무조건 외부로 보내는 키워드 (예: "전체 리팩토링") |
 | `external_tools.default` | 기본 외부 도구 (`claude_code` \| `codex`) |
+| `external_tools.claude_code.enabled` | claude_code 외부 도구 사용 여부 (기본 `true`) |
 | `external_tools.claude_code.command` | Claude Code 실행 명령 (기본 `["claude", "-p"]`) |
+| `external_tools.codex.enabled` | codex 외부 도구 사용 여부 (기본 `true`) |
 | `external_tools.codex.command` | Codex 실행 명령 (기본 `["codex", "exec"]`) |
 | `harness.max_recovery_retries` | 검증 실패 시 자동 복구 재시도 횟수 (기본 3) |
 | `harness.verify_timeout_sec` | 검증 명령 타임아웃 초 (기본 120) |
@@ -409,6 +416,20 @@ AI Agent 작업 지표 (기대효과 정량화)
 | `harness.exclude_dirs` | 파일 탐색에서 제외할 디렉토리 |
 
 외부 CLI의 비대화형 실행 옵션이 다르면 `external_tools`의 `command` 값을 수정하세요.
+
+### 메인 LLM 백엔드 우선순위 (local_llm / openrouter)
+
+파일선택·계획수립·라우팅·잡담판단에 쓰는 "메인 LLM"은 다음 순서로 정해집니다:
+
+1. `local_llm.enabled: true` → Ollama 사용 (둘 다 켜져 있어도 **local이 항상 우선**)
+2. `local_llm.enabled: false` 이고 `openrouter.enabled: true` → OpenRouter 사용
+3. 둘 다 `false` → 메인 LLM 없이 바로 외부 도구(`claude_code`/`codex`)로 위임
+4. 외부 도구까지 전부 `enabled: false`면 에러 메시지를 출력하고 중단합니다
+
+OpenRouter를 쓰려면 `local_llm.enabled`를 `false`로 내리고 `openrouter.enabled: true` +
+`api_key`(또는 `OPENROUTER_API_KEY` 환경변수)를 설정하세요. `claude_code`/`codex`는 평소엔
+`enabled: true` 그대로 두고, 특정 CLI를 설치하지 않았거나 일시적으로 막고 싶을 때만 `false`로
+내리면 라우터/에이전트가 자동으로 그 도구를 건너뜁니다.
 
 ---
 
