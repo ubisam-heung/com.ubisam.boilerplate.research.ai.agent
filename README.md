@@ -12,6 +12,26 @@
 
 ---
 
+## 목차
+
+- [무엇인가 / 무엇이 아닌가](#무엇인가--무엇이-아닌가)
+- [0. Windows 사전 준비 (WSL 2)](#0-windows-사전-준비-wsl-2)
+- [1. 사전 준비](#1-사전-준비)
+- [2. 설치](#2-설치)
+- [3. 업데이트 (update.sh)](#3-업데이트-updatesh)
+- [4. 설치 점검 (doctor.sh)](#4-설치-점검-doctorsh)
+- [5. 실행](#5-실행)
+- [6. 실행 모델 선택 (/model)](#6-실행-모델-선택-model)
+- [6-1. 작업 지표 (metrics)](#6-1-작업-지표-metrics)
+- [7. 설정 (config.yaml)](#7-설정-configyaml)
+- [8. 가드레일 / 안전장치](#8-가드레일--안전장치)
+- [9. 디렉토리 구조](#9-디렉토리-구조)
+- [10. 동작 확인 체크리스트](#10-동작-확인-체크리스트)
+- [11. 문제 해결](#11-문제-해결)
+- [12. GitHub 리포지토리 연동 & PR 워크플로우](#12-github-리포지토리-연동--pr-워크플로우)
+
+---
+
 ## 무엇인가 / 무엇이 아닌가
 
 - **이다**: ollama로 직접 도는 **독립 실행형 에이전트**. 관련 파일 탐색 → 라우팅 판단 →
@@ -568,6 +588,102 @@ demo-agent-project/          ← 프레임워크 (바깥)
 | 모델이 너무 느림 / 메모리 부족 | `config.yaml`의 `local_llm.model`을 더 작은 모델로 변경 |
 | `python3: command not found` (WSL) | `sudo apt install -y python3 python3-venv python3-pip` |
 | 외부 CLI 옵션 오류 | `config.yaml`의 `external_tools.*.command` 수정 |
+
+---
+
+## 12. GitHub 리포지토리 연동 & PR 워크플로우
+
+Boilerplate Project 생성 및 AI Agent 연동 가이드입니다.
+
+### 12-1. 리포지토리 생성
+
+GitHub에서 각자 프로젝트별 (현재 예시는 `com.ubisam.boilerplate.project` 입니다) 리포지토리를 생성합니다.
+
+### 12-2. Branch Protection Ruleset 설정
+
+생성한 프로젝트의 `main` 브랜치에 Ruleset을 추가합니다.
+
+**Settings → Rules → Rulesets → New branch ruleset**
+
+#### 기본 설정
+
+| 항목 | 값 |
+|---|---|
+| Ruleset Name | `main` |
+| Enforcement status | **Active** ⚠️ (기본값 Disabled → 반드시 변경) |
+
+#### Target branches
+
+**Add target → Default branch** 를 선택합니다.
+
+#### Branch rules 체크 항목
+
+| 항목 | 설정 |
+|---|---|
+| Restrict deletions | ✅ |
+| Require a pull request before merging | ✅ |
+| Block force pushes | ✅ |
+
+> **Require a pull request before merging** 선택 시 하위 옵션이 펼쳐집니다.  
+> Required approvals는 `0`으로 두면 승인 없이 본인이 직접 merge 가능합니다.
+
+설정 후 **Create** 버튼을 클릭합니다.
+
+### 12-3. AI Agent 설치 및 Clone
+
+AI Agent가 설치된 디렉토리의 `workspace` 안에 해당 리포지토리를 클론합니다.
+
+```bash
+cd <ai-agent>/workspace
+git clone https://github.com/ubisam/com.ubisam.boilerplate.project
+cd com.ubisam.boilerplate.project
+```
+
+### 12-4. 작업 브랜치 생성 및 Push
+
+사용할 AI 도구에 따라 브랜치를 생성하고 원격에 등록합니다.
+
+**Claude 사용 시**
+```bash
+git checkout -b claude
+git push origin claude
+```
+
+**Codex 사용 시**
+```bash
+git checkout -b codex
+git push origin codex
+```
+
+### 12-5. 작업 및 Pull Request
+
+각 브랜치에서 AI Agent로 작업을 진행한 후 GitHub에서 Pull Request를 생성하여 `main`으로 merge 합니다.
+
+> Branch Protection Rule에 의해 직접 push는 불가하며, PR을 통해서만 merge할 수 있습니다.
+
+### 12-6. Merge 후 브랜치 동기화
+
+PR merge 완료 후 작업 브랜치를 최신 `main` 상태로 동기화합니다.
+
+**Claude 브랜치**
+```bash
+git checkout claude
+git pull origin main
+```
+
+**Codex 브랜치**
+```bash
+git checkout codex
+git pull origin main
+```
+
+### 작업 흐름 요약
+
+```
+main (보호됨)
+ ├─ claude ──[작업]──▶ Pull Request ──▶ merge ──▶ git pull origin main
+ └─ codex  ──[작업]──▶ Pull Request ──▶ merge ──▶ git pull origin main
+```
 
 ---
 
