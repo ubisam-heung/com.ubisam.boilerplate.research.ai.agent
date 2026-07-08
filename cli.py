@@ -47,8 +47,8 @@ console = Console(highlight=False)
 
 VERSION = "1.0.0"
 
-# 선택 가능한 실행 모델. auto=자동 라우팅, 나머지는 해당 백엔드 강제.
-MODELS = ("auto", "local", "claude", "codex")
+# 대화형 /model 선택지. 단일 작업 실행은 내부적으로 auto 라우팅을 계속 사용한다.
+MODELS = ("codex", "claude", "local", "openrouter")
 _MODEL_ALIASES = {"claude_code": "claude", "claudecode": "claude"}
 
 # 슬래시 없이도 인식할 명령어. (예: "exit" == "/exit")
@@ -60,7 +60,7 @@ _ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?(?:\x07|\x1b\\)")
 _MAX_TAIL_CHARS = 4000  # 외부 도구 출력은 이만큼만 보관(이어하기용 요약 목적, 전체 로그 아님)
 
 
-def run_with_capture(cmd: List[str], cwd: str, max_tail: int = _MAX_TAIL_CHARS) -> tuple:
+def run_with_capture(cmd: List[str], cwd: str, max_tail: int = _MAX_TAIL_CHARS, record_fn=None) -> tuple:
     """claude/codex를 진짜 pty에 붙여 실행한다.
 
     pty.spawn은 자식에 실제 TTY를 주기 때문에 권한 승인 UI·컬러·대화 연속성이 네이티브와
@@ -76,6 +76,10 @@ def run_with_capture(cmd: List[str], cwd: str, max_tail: int = _MAX_TAIL_CHARS) 
             overflow = len(tail) - max_tail * 4
             if overflow > 0:
                 del tail[:overflow]
+            if record_fn is not None:
+                clean_chunk = _ANSI_RE.sub(b"", data).decode("utf-8", errors="replace")
+                if clean_chunk.strip():
+                    record_fn(clean_chunk)
         return data
 
     prev_cwd = os.getcwd()
@@ -111,10 +115,12 @@ class SessionRecorder:
         self._cur_input = user_input
         self._cur_model = model
         self._buf = []
+        self.save()
 
     def append(self, line: str):
         if self._cur_input is not None:
             self._buf.append(line)
+            self.save()
 
     def last_turn(self) -> Optional[dict]:
         return self.turns[-1] if self.turns else None
@@ -131,19 +137,33 @@ class SessionRecorder:
         })
         self._cur_input = None
         self._buf = []
+        self.save()
 
     def save(self, tag: str = "", status: str = "active") -> Optional[Path]:
-        if not self.turns:
+        current_turn = None
+        if self._cur_input is not None:
+            current_turn = {
+                "ts": datetime.now().strftime("%H:%M:%S"),
+                "model": self._cur_model,
+                "input": self._cur_input,
+                "output": "\n".join(self._buf)[-_MAX_TAIL_CHARS:],
+                "interactive": False,
+                "in_progress": True,
+            }
+        if not self.turns and current_turn is None:
             return None
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         if self._path is None:
             suffix = f"_{tag}" if tag else ""
             self._path = self.sessions_dir / f"{self.session_id}{suffix}.json"
+        turns = list(self.turns)
+        if current_turn is not None:
+            turns.append(current_turn)
         data = {
             "session_id": self.session_id,
             "started_at": self.started_at.isoformat(),
             "status": status,
-            "turns": self.turns,
+            "turns": turns,
         }
         self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return self._path
@@ -201,7 +221,7 @@ _HELP = """\
 [bold]명령어[/bold]  [dim](슬래시 없이 입력해도 됩니다: exit == /exit)[/dim]
 
   [cyan]/help[/cyan]            이 도움말
-  [cyan]/model[/cyan]           실행 모델 선택 (auto·local·claude·codex)
+  [cyan]/model[/cyan]           실행 모델 선택 (codex·claude·local·openrouter)
   [cyan]/status[/cyan]          연결 상태 확인
   [cyan]/config[/cyan]          현재 설정 보기
   [cyan]/metrics[/cyan]         작업 지표 요약 (로컬처리율·복구율 등)
@@ -307,6 +327,7 @@ def _check_status(config: dict, project_dir: str) -> dict:
         "model": "—",
         "project_dir": project_dir,
         "local_enabled": config.get("local_llm", {}).get("enabled", True),
+        "openrouter_enabled": config.get("openrouter", {}).get("enabled", False),
         "claude_enabled": tool_enabled(config, "claude_code"),
         "codex_enabled": tool_enabled(config, "codex"),
     }
@@ -353,8 +374,18 @@ def _print_status(status: dict):
               "[green]활성화[/green]" if status.get("claude_enabled") else "[dim]비활성화[/dim]")
     t.add_row(dot_ok if status.get("codex_enabled") else dot_dim, "codex",
               "[green]활성화[/green]" if status.get("codex_enabled") else "[dim]비활성화[/dim]")
+    t.add_row(dot_ok if status.get("openrouter_enabled") else dot_dim, "openrouter",
+              "[green]활성화[/green]" if status.get("openrouter_enabled") else "[dim]비활성화[/dim]")
     t.add_row(dot_dim, "프로젝트", f"[dim]{escape(status['project_dir'])}[/dim]")
     console.print(t)
+
+
+def _default_model(config: dict) -> str:
+    """대화형 기본 모델. 가능한 한 로컬 우선으로 시작한다."""
+    for model in ("local", "openrouter", "claude", "codex"):
+        if _model_enabled(config, model):
+            return model
+    return "local"
 
 
 # ─── 대화형 루프 ─────────────────────────────────────────────────────────────
@@ -382,7 +413,7 @@ def run_interactive(project_dir: str = "."):
     recorder = SessionRecorder(sessions_dir)
 
     history: List[str] = []
-    ui = {"model": "auto"}
+    ui = {"model": _default_model(config)}
     pending_preamble = {"text": ""}
 
     crashed = SessionRecorder.find_crashed(sessions_dir)
@@ -435,18 +466,19 @@ def run_interactive(project_dir: str = "."):
             # 명시적 외부 모델: 대화형 세션으로 전환 후 즉시 저장
             preamble = _next_preamble(pending_preamble, recorder, ui["model"])
             tail = _run_external_interactive(ui["model"], task, _work_root(project_dir, config), config,
-                                              resume_preamble=preamble)
+                                              resume_preamble=preamble, record_fn=recorder.append)
             recorder.end_turn(interactive=True, tail=tail)
             _autosave(recorder)
-        elif ui["model"] == "local":
-            # 로컬 강제: 기존 파이프라인 실행
+        elif ui["model"] in ("local", "openrouter"):
+            # LLM 파이프라인 강제 실행
             def _rec_log(msg: str, _r=recorder):
                 _r.append(msg)
                 _rich_log(msg)
-            _run_task(task, project_dir, "local", log_fn=_rec_log)
+            _run_task(task, project_dir, ui["model"], log_fn=_rec_log)
             recorder.end_turn()
+            _autosave(recorder)
         else:
-            # auto: 잡담은 로컬, 코딩은 외부 대화형 세션으로 직행
+            # 내부 호환용 auto: run_agent가 local_llm -> OpenRouter -> external_tools 순서로 라우팅한다.
             _run_auto_mode(task, project_dir, config, recorder, pending_preamble)
 
     # 세션 종료 시 자동 저장
@@ -562,11 +594,13 @@ def _handle_command(
 
 
 def _model_enabled(config: dict, model: str) -> bool:
-    """auto는 항상 허용. local/claude/codex는 config.yaml의 enabled 플래그를 따른다."""
+    """local/openrouter/claude/codex는 config.yaml의 enabled 플래그를 따른다."""
     if model in ("auto",):
         return True
     if model == "local":
         return config.get("local_llm", {}).get("enabled", True)
+    if model == "openrouter":
+        return config.get("openrouter", {}).get("enabled", False)
     tool_key = "codex" if model == "codex" else "claude_code"
     return config.get("external_tools", {}).get(tool_key, {}).get("enabled", True)
 
@@ -592,7 +626,8 @@ def _next_preamble(pending_preamble: dict, recorder: "SessionRecorder", next_mod
     return ""
 
 
-def _run_external_interactive(model: str, task: str, work_root: str, config: dict, resume_preamble: str = "") -> str:
+def _run_external_interactive(model: str, task: str, work_root: str, config: dict,
+                              resume_preamble: str = "", record_fn=None) -> str:
     """진짜 claude/codex 대화형 세션으로 현재 터미널을 넘긴다(핸드오프).
 
     pty로 실행해 권한 승인·대화 연속성은 네이티브로 동작시키면서, 마지막 출력 일부만 가볍게
@@ -628,7 +663,7 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
     t0 = time.monotonic()
     tail = ""
     try:
-        _, tail = run_with_capture(cmd, work_root)
+        _, tail = run_with_capture(cmd, work_root, record_fn=record_fn)
     except KeyboardInterrupt:
         pass
 
@@ -690,50 +725,17 @@ def _is_obviously_coding(task: str) -> bool:
 
 def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionRecorder,
                     pending_preamble: Optional[dict] = None):
-    """auto 모드: 명백한 코딩은 즉시 외부 위임, 애매하면 LLM 1회로 잡담/코딩 판단."""
-    from router import pick_external_tool
+    """auto 모드: local_llm이 먼저 받고, 필요할 때 OpenRouter/외부 도구 순으로 폴백한다."""
+    if pending_preamble and pending_preamble.get("text"):
+        recorder.append("[안내] auto 모드에서는 이전 외부 대화 요약을 직접 주입하지 않습니다.")
+        pending_preamble["text"] = ""
 
-    model = pick_external_tool(config)
-    work_root = _work_root(project_dir, config)
-    pending_preamble = pending_preamble if pending_preamble is not None else {"text": ""}
+    def _rec_log(msg: str, _r=recorder):
+        _r.append(msg)
+        _rich_log(msg)
 
-    if model is None:
-        console.print("  [bold red]오류:[/bold red]  활성화된 외부 도구가 없습니다 (claude_code/codex 모두 비활성화).")
-        recorder.append("[오류] 활성화된 외부 도구 없음")
-        recorder.end_turn()
-        return
-
-    # 명백한 코딩 신호가 있으면 LLM 호출 없이 즉시 외부로
-    if _is_obviously_coding(task):
-        preamble = _next_preamble(pending_preamble, recorder, model)
-        tail = _run_external_interactive(model, task, work_root, config, resume_preamble=preamble)
-        recorder.end_turn(interactive=True, tail=tail)
-        _autosave(recorder)
-        return
-
-    # 애매한 경우: 파이프라인 백엔드(local_llm/openrouter)가 켜져 있으면 1회 호출로 잡담 여부만 판단
-    from agent import _build_main_llm
-    llm = _build_main_llm(config)
-    ollama_ok = False
-    if llm is not None:
-        try:
-            ollama_ok = llm.health_check()
-        except Exception:
-            ollama_ok = False
-
-    from router import is_chatter, reply_chatter
-
-    if ollama_ok and is_chatter(llm, task):
-        reply = reply_chatter(llm, task)
-        recorder.append(reply)
-        _rich_log(reply)
-        recorder.end_turn()
-        return
-
-    # 잡담 아닌 것으로 판단(또는 Ollama 없음) → 외부 위임
-    preamble = _next_preamble(pending_preamble, recorder, model)
-    tail = _run_external_interactive(model, task, work_root, config, resume_preamble=preamble)
-    recorder.end_turn(interactive=True, tail=tail)
+    _run_task(task, project_dir, "auto", log_fn=_rec_log)
+    recorder.end_turn()
     _autosave(recorder)
 
 

@@ -8,7 +8,7 @@ local_llm:
   temperature: 0.7
 
 openrouter:
-  enabled: false   # 아직 미적용. true로 바꾸기 전엔 코드에서 사용되지 않음
+  enabled: false   # true면 local_llm 위임/폴백 시 external_tools보다 먼저 사용
   base_url: "https://openrouter.ai/api/v1"
   api_key: ""      # 비워두면 OPENROUTER_API_KEY 환경변수 사용
   model: "anthropic/claude-3.5-sonnet"

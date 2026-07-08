@@ -1,7 +1,8 @@
 # ai-agent — 하이브리드 코딩 에이전트
 
-작업 설명을 받아 **로컬 LLM(Ollama)** 으로 작은 작업을 처리하고, 크고 복잡한 작업은
-**외부 도구(Claude Code / Codex CLI)** 로 위임하는 하네스 기반 코딩 에이전트입니다.
+작업 설명을 받아 **로컬 LLM(Ollama)** 으로 먼저 분석하고, 필요하면
+**OpenRouter**를 거친 뒤 **외부 도구(Claude Code / Codex CLI)** 로 폴백하는
+하네스 기반 코딩 에이전트입니다.
 
 이 README 하나만 보고 처음부터 끝까지 설치·실행할 수 있도록 작성했습니다.
 
@@ -35,7 +36,7 @@
 ## 무엇인가 / 무엇이 아닌가
 
 - **이다**: ollama로 직접 도는 **독립 실행형 에이전트**. 관련 파일 탐색 → 라우팅 판단 →
-  (로컬) 계획·변경·검증·자동 복구 / (외부) Claude Code·Codex 위임까지 자체 파이프라인으로 수행합니다.
+  (로컬/OpenRouter) 계획·변경·검증·자동 복구 / (외부) Claude Code·Codex 위임까지 자체 파이프라인으로 수행합니다.
 - **아니다**: 단순 프롬프트 래퍼가 아닙니다. 검증(`verify_commands`)과 백업·자동 복구, 가드레일 hook을 포함합니다.
 
 ### 동작 흐름
@@ -45,10 +46,11 @@
  └─> 관련 파일 탐색 (로컬 LLM)
       └─> 라우팅 판단 (local | external)
            ├─ [local]    계획 수립 → diff 생성/적용 → 검증 → 실패 시 자동 복구(최대 N회)
-           └─ [external]  Claude Code / Codex CLI 호출
+           └─ [external]  OpenRouter 우선 시도 → 실패 시 Claude Code / Codex CLI 호출
 ```
 
-라우팅은 자동(`auto`)이 기본이며, 대화형 모드에서 `/model` 명령으로 `local`·`claude`·`codex`를 강제할 수도 있습니다.
+단일 작업 실행은 자동 라우팅을 사용합니다. 대화형 모드에서는 `/model` 명령으로
+`local`·`openrouter`·`claude`·`codex` 중 하나를 선택합니다.
 
 ---
 
@@ -133,7 +135,7 @@ curl http://localhost:11434/api/tags
 
 ### 1-3. 외부 도구 — Claude Code / Codex CLI (필수)
 
-`auto` 라우팅에서 큰 작업이 외부로 위임되거나, `/model claude` · `/model codex`를
+자동 라우팅에서 큰 작업이 외부로 위임되거나, `/model claude` · `/model codex`를
 쓰려면 해당 CLI가 PATH에 있어야 합니다. 로컬(`local`)만 쓸 거라면 건너뛰어도 됩니다.
 
 **Home Directory 이동** 
@@ -295,10 +297,11 @@ cp -r ~/my-existing-project/* workspace/   # 예: 기존 코드를 작업 폴더
 프롬프트가 뜨면 자연어로 작업을 입력합니다:
 
 ```
-agent (auto) ❯ user.py에 이메일 형식 검증 함수를 추가해줘
+agent (local) ❯ user.py에 이메일 형식 검증 함수를 추가해줘
 ```
 
-괄호 안(`auto`)은 현재 선택된 실행 모델입니다.
+괄호 안(`local`)은 현재 선택된 실행 모델입니다. 기본값은 활성 설정에 따라
+`local → openrouter → claude → codex` 순서로 고릅니다.
 
 ### 단일 작업 모드
 
@@ -330,8 +333,13 @@ agent (local) ❯ Calculator/main.py가 무슨 코드인지 설명해줘
 | `/config` | 현재 `config.yaml` 설정 보기 |
 | `/metrics` | 작업 지표 요약 (로컬처리율·검증/복구율·비용절감) |
 | `/history` | 최근 작업 목록 |
+| `/save [태그]` | 현재 세션 JSON 저장 |
 | `/clear` | 화면 지우기 |
 | `/exit` | 종료 |
+
+대화 세션은 `sessions/` 아래 JSON 파일로 저장됩니다. 입력이 시작되면 `in_progress: true` 상태로
+즉시 기록되고, local/OpenRouter/external_tools 출력이 들어올 때마다 같은 파일이 갱신됩니다.
+정상 종료 또는 턴 완료 후에는 완료된 턴으로 정리됩니다.
 
 ---
 
@@ -341,20 +349,21 @@ agent (local) ❯ Calculator/main.py가 무슨 코드인지 설명해줘
 선택한 모델은 프롬프트에 `agent (claude) ❯` 처럼 표시됩니다.
 
 ```
-agent (auto) ❯ /model claude
+agent (local) ❯ /model claude
   ✓  실행 모델을 claude 로 설정했습니다.
 agent (claude) ❯
 ```
 
 | 값 | 동작 |
 |---|---|
-| `auto` | 기본. 라우터가 작업 크기를 보고 local/external 자동 판단 |
-| `local` | 라우팅을 건너뛰고 **로컬 LLM 강제** (Ollama 필요) |
-| `claude` | **진짜 Claude Code 대화형 세션으로 전환** (TTY 핸드오프) |
 | `codex` | **진짜 Codex 대화형 세션으로 전환** (TTY 핸드오프) |
+| `claude` | **진짜 Claude Code 대화형 세션으로 전환** (TTY 핸드오프) |
+| `local` | **로컬 LLM 강제** (Ollama 필요). 실패 시 OpenRouter/외부 도구로 폴백 |
+| `openrouter` | **OpenRouter LLM 강제**. 실패 시 외부 도구로 폴백 |
 
 - 인자 없이 `/model` 만 입력하면 현재 모델과 선택지를 보여줍니다.
-- `local`은 로컬 LLM이라 Ollama가 필요하고, `claude`/`codex`는 Ollama 없이도 동작합니다.
+- `local`은 Ollama가 필요하고, `openrouter`는 `OPENROUTER_API_KEY` 또는 `config.yaml`의 API 키가 필요합니다.
+- `claude`/`codex`는 해당 CLI가 PATH에 있으면 Ollama 없이도 동작합니다.
 
 ### claude / codex 대화형 핸드오프
 
@@ -375,8 +384,8 @@ agent (claude) ❯
 - 작업은 `workspace/`(= `harness.work_dir`)에서 실행됩니다.
 - 대화형 실행 명령은 `config.yaml`의 `external_tools.*.interactive_command`로 바꿀 수 있습니다.
 
-> 참고: 자동 라우팅(`auto`)에서 외부로 위임될 때는 기존처럼 비대화형 1회성(`-p`/`exec`)으로 호출됩니다.
-> 대화형 세션이 필요하면 `/model claude`처럼 명시적으로 선택하세요.
+> 참고: 단일 작업 모드와 내부 자동 라우팅에서 외부로 위임될 때는 비대화형 1회성(`-p`/`exec`)으로 호출됩니다.
+> 대화형 세션이 필요하면 `/model claude` 또는 `/model codex`처럼 명시적으로 선택하세요.
 
 ---
 
@@ -418,14 +427,14 @@ AI Agent 작업 지표 (기대효과 정량화)
 | `local_llm.model` | 메인 코딩 모델 (기본 `qwen2.5-coder:7b`) |
 | `local_llm.router_model` | 라우팅 판단용 경량 모델 (기본 `qwen2.5:3b`) |
 | `local_llm.base_url` | Ollama 주소 (기본 `http://localhost:11434`) |
-| `openrouter.enabled` | OpenRouter를 메인 백엔드로 사용 여부 (기본 `false`) |
+| `openrouter.enabled` | OpenRouter 사용 여부. 자동/로컬 폴백과 `/model openrouter`에서 사용 (기본 `false`) |
 | `openrouter.api_key` | OpenRouter API 키 (비워두면 `OPENROUTER_API_KEY` 환경변수 사용) |
 | `openrouter.model` | 사용할 모델 ID (예: `anthropic/claude-3.5-sonnet`) |
 | `openrouter.base_url` | OpenRouter API 주소 (기본 `https://openrouter.ai/api/v1`) |
 | `routing.max_local_files` | 이 파일 수를 넘으면 외부로 라우팅 |
 | `routing.max_local_tokens` | 이 토큰 수를 넘으면 외부로 라우팅 |
 | `routing.force_external_keywords` | 포함 시 무조건 외부로 보내는 키워드 (예: "전체 리팩토링") |
-| `external_tools.default` | 기본 외부 도구 (`claude_code` \| `codex`) |
+| `external_tools.default` | OpenRouter 실패 후 사용할 기본 외부 도구 (`claude_code` \| `codex`) |
 | `external_tools.claude_code.enabled` | claude_code 외부 도구 사용 여부 (기본 `true`) |
 | `external_tools.claude_code.command` | Claude Code 실행 명령 (기본 `["claude", "-p"]`) |
 | `external_tools.codex.enabled` | codex 외부 도구 사용 여부 (기본 `true`) |
@@ -434,22 +443,24 @@ AI Agent 작업 지표 (기대효과 정량화)
 | `harness.verify_timeout_sec` | 검증 명령 타임아웃 초 (기본 120) |
 | `harness.backup_dir` | 변경 전 백업 디렉토리 (기본 `.agent_backup`) |
 | `harness.exclude_dirs` | 파일 탐색에서 제외할 디렉토리 |
+| `sessions.dir` | 대화 세션 JSON 저장 디렉토리. 진행 중에도 실시간에 가깝게 갱신 |
 
 외부 CLI의 비대화형 실행 옵션이 다르면 `external_tools`의 `command` 값을 수정하세요.
 
-### 메인 LLM 백엔드 우선순위 (local_llm / openrouter)
+### 백엔드 우선순위 (local_llm / openrouter / external_tools)
 
-파일선택·계획수립·라우팅·잡담판단에 쓰는 "메인 LLM"은 다음 순서로 정해집니다:
+단일 작업 모드와 내부 자동 라우팅은 다음 순서로 처리됩니다:
 
-1. `local_llm.enabled: true` → Ollama 사용 (둘 다 켜져 있어도 **local이 항상 우선**)
-2. `local_llm.enabled: false` 이고 `openrouter.enabled: true` → OpenRouter 사용
-3. 둘 다 `false` → 메인 LLM 없이 바로 외부 도구(`claude_code`/`codex`)로 위임
-4. 외부 도구까지 전부 `enabled: false`면 에러 메시지를 출력하고 중단합니다
+1. `local_llm.enabled: true` → Ollama가 먼저 파일 선택·분석·라우팅을 수행
+2. 라우팅 결과가 external이거나 로컬 계획/변경이 실패했고 `openrouter.enabled: true` → OpenRouter가 먼저 작업 시도
+3. OpenRouter가 비활성화되어 있거나 연결/API/계획/변경 실패 → 외부 도구(`claude_code`/`codex`)로 폴백
+4. local_llm과 openrouter가 모두 꺼져 있으면 바로 외부 도구로 위임
+5. 외부 도구까지 전부 `enabled: false`면 에러 메시지를 출력하고 중단합니다
 
-OpenRouter를 쓰려면 `local_llm.enabled`를 `false`로 내리고 `openrouter.enabled: true` +
-`api_key`(또는 `OPENROUTER_API_KEY` 환경변수)를 설정하세요. `claude_code`/`codex`는 평소엔
-`enabled: true` 그대로 두고, 특정 CLI를 설치하지 않았거나 일시적으로 막고 싶을 때만 `false`로
-내리면 라우터/에이전트가 자동으로 그 도구를 건너뜁니다.
+`/model local`은 Ollama를 강제하고, `/model openrouter`는 OpenRouter를 강제합니다.
+OpenRouter를 쓰려면 `openrouter.enabled: true`와 `api_key`(또는 `OPENROUTER_API_KEY`)를 설정하세요.
+`claude_code`/`codex`는 평소엔 `enabled: true` 그대로 두고, 특정 CLI를 설치하지 않았거나
+일시적으로 막고 싶을 때만 `false`로 내리면 됩니다.
 
 ---
 
@@ -546,12 +557,12 @@ demo-agent-project/          ← 프레임워크 (바깥)
 ├── agent              # 실행 런처 (./agent)
 ├── agent.py           # 메인 진입점 (run_agent)
 ├── cli.py             # 대화형 TUI
-├── router.py          # local / external 라우팅
+├── router.py          # local / openrouter / external 라우팅
 ├── config.yaml        # 설정 한 곳 (harness.work_dir 포함)
 ├── doctor.sh          # 진단 스크립트
 ├── AGENTS.md          # 에이전트 행동 규칙(가드레일)
 ├── requirements.txt
-├── backends/          # LLM·외부 도구 어댑터 (local_llm / claude_code_cli / codex_cli)
+├── backends/          # LLM·외부 도구 어댑터 (local_llm / openrouter / claude_code_cli / codex_cli)
 ├── harness/           # 실행 파이프라인 (context/planner/executor/verifier/recovery/hooks)
 ├── src/               # 프레임워크 공용 유틸
 ├── memory/            # 에이전트 메모리
@@ -574,7 +585,7 @@ demo-agent-project/          ← 프레임워크 (바깥)
 3. `./doctor.sh .` 전체 `✓` 확인
 4. 작은 작업으로 먼저 테스트 (예: 단일 함수 추가)
 5. `.agent_backup/`에 변경 전 파일이 백업되는지 확인
-6. 큰 작업("전체 리팩토링" 등)을 입력해 외부 도구로 라우팅되는지 확인
+6. 큰 작업("전체 리팩토링" 등)을 입력해 OpenRouter 또는 외부 도구로 라우팅되는지 확인
 
 ---
 
@@ -584,6 +595,7 @@ demo-agent-project/          ← 프레임워크 (바깥)
 |---|---|
 | `Ollama 서버에 연결할 수 없습니다` | `ollama serve` 미실행. 별도 터미널에서 실행 |
 | `ollama serve` → `address already in use` | 이미 실행 중. 정상이므로 무시 |
+| `/model openrouter` 가 동작 안 함 | `openrouter.enabled: true`와 `OPENROUTER_API_KEY` 또는 `openrouter.api_key` 확인 |
 | `/model claude` 가 동작 안 함 | `claude` CLI 미설치 또는 미로그인. [1-3](#1-3-선택-외부-도구--claude-code--codex-cli) 참고 |
 | 모델이 너무 느림 / 메모리 부족 | `config.yaml`의 `local_llm.model`을 더 작은 모델로 변경 |
 | `python3: command not found` (WSL) | `sudo apt install -y python3 python3-venv python3-pip` |
@@ -686,4 +698,3 @@ main (보호됨)
 ```
 
 ---
-

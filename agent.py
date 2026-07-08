@@ -39,6 +39,31 @@ def _build_main_llm(cfg: dict):
     return None
 
 
+def _build_local_llm(cfg: dict):
+    """local_llm이 켜져 있으면 Ollama LLM을 만든다."""
+    llm_cfg = cfg.get("local_llm", {})
+    if not llm_cfg.get("enabled", True):
+        return None
+    return LocalLLM(
+        model=llm_cfg["model"],
+        base_url=llm_cfg["base_url"],
+        temperature=llm_cfg.get("temperature", 0.2),
+    )
+
+
+def _build_openrouter_llm(cfg: dict):
+    """OpenRouter가 켜져 있으면 별도 위임용 LLM을 만든다."""
+    or_cfg = cfg.get("openrouter", {})
+    if not or_cfg.get("enabled", False):
+        return None
+    return OpenRouterLLM(
+        model=or_cfg.get("model", ""),
+        api_key=or_cfg.get("api_key", ""),
+        base_url=or_cfg.get("base_url", "https://openrouter.ai/api/v1"),
+        temperature=or_cfg.get("temperature", 0.2),
+    )
+
+
 def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -92,6 +117,151 @@ def _delegate_external(tool: str, task: str, hook_roots, run_root: str, log_fn, 
     log_fn(f"[적용] {tool}로 변경을 파일에 반영합니다...")
     applied = _run_external(tool, task, run_root, apply=True)
     log_fn(applied["output"])
+
+
+def _run_change_pipeline(llm, task: str, files: list[str], file_contents: dict[str, str],
+                         work_root: str, hook_roots, cfg: dict, log_fn,
+                         guide: str = "", step_prefix: str = "") -> dict:
+    """주어진 LLM으로 계획→변경→검증 파이프라인을 실행한다.
+
+    반환 dict의 success=False는 상위 호출자가 다음 백엔드로 폴백해도 된다는 뜻이다.
+    """
+    label = f"{step_prefix} " if step_prefix else ""
+    log_fn(f"{label}[계획] 변경 계획 수립 중...")
+    plan = planner.make_plan(llm, task, file_contents, guide=guide)
+
+    if not plan["changes"]:
+        log_fn(f"{label}[안내] 수행할 변경 사항이 없습니다.")
+        return {"success": False, "reason": "no_changes"}
+
+    plan["changes"], dropped = planner.validate_changes(plan["changes"], files)
+    for raw, why in dropped:
+        log_fn(f"{label}[검증] 변경 항목 폐기: {raw!r} ({why})")
+
+    if not plan["changes"]:
+        return {"success": False, "reason": "invalid_changes"}
+
+    missing = planner.untouched_targets(task, files, plan["changes"])
+    if missing:
+        log_fn(f"{label}[검증] 작업이 지정한 파일을 계획이 건드리지 않음: {missing}")
+        return {"success": False, "reason": "offtarget", "missing": missing}
+
+    for c in plan["changes"]:
+        log_fn(f"  - {c['action']}: {c['file']} :: {c['description']}")
+
+    backup_dir = cfg["harness"]["backup_dir"]
+    max_retries = cfg["harness"]["max_recovery_retries"]
+    timeout = cfg["harness"]["verify_timeout_sec"]
+
+    verify_ran = False
+    all_passed_final = True
+    recovery_attempts_total = 0
+
+    for change in plan["changes"]:
+        f = change["file"]
+        current = file_contents.get(f, "")
+        log_fn(f"\n{label}[변경] 변경 생성 중: {f}")
+        new_content, diff = executor.generate_change(llm, f, current, change["description"])
+        log_fn(diff if diff.strip() else "(diff 없음 - 새 파일)")
+
+        try:
+            hooks.check_pre_file(hook_roots, f)
+        except hooks.HookBlocked as e:
+            log_fn(f"{label}[차단됨] {f} 변경을 건너뜁니다: {e.message}")
+            all_passed_final = False
+            continue
+
+        try:
+            backup_path = executor.apply_change(work_root, f, new_content, backup_dir)
+        except executor.PathEscapeError:
+            log_fn(f"{label}[차단] {f}: 작업 폴더(work_root) 밖 경로라 적용을 거부했습니다.")
+            all_passed_final = False
+            continue
+        log_fn(f"{label}[변경] 적용 완료: {f} (백업: {backup_path})")
+
+        post_edit_output = hooks.run_post_edit(hook_roots, f)
+        if post_edit_output:
+            log_fn(f"{label}[post-edit] {post_edit_output}")
+
+        verify_cmds = plan.get("verify_commands", [])
+        if not verify_cmds:
+            log_fn(f"{label}[검증] 검증 명령 없음, 건너뜀")
+            continue
+
+        log_fn(f"{label}[검증] 실행 중...")
+        blocked = False
+        for cmd in verify_cmds:
+            try:
+                hooks.check_pre_bash(hook_roots, cmd)
+            except hooks.HookBlocked as e:
+                log_fn(f"{label}[차단됨] 검증 명령 차단: {e.message}")
+                blocked = True
+        if blocked:
+            all_passed_final = False
+            continue
+
+        results = verifier.run_verification(verify_cmds, work_root, timeout)
+        verify_ran = True
+        for r in results:
+            log_fn(f"  $ {r['cmd']} -> {'OK' if r['success'] else 'FAIL'}")
+            if not r["success"]:
+                log_fn(f"    --- output ---\n{r['output'][:2000]}\n    --------------")
+
+        attempt = 0
+        while not verifier.all_passed(results) and attempt < max_retries:
+            attempt += 1
+            failed = next(r for r in results if not r["success"])
+            log_fn(f"{label}[복구] 검증 실패, 자동 복구 시도 {attempt}/{max_retries}")
+            with open(f"{work_root}/{f}", "r", encoding="utf-8") as fp:
+                cur = fp.read()
+            recovery.recover_file(llm, work_root, f, cur, failed)
+            results = verifier.run_verification(verify_cmds, work_root, timeout)
+            for r in results:
+                log_fn(f"  $ {r['cmd']} -> {'OK' if r['success'] else 'FAIL'}")
+                if not r["success"]:
+                    log_fn(f"    --- output ---\n{r['output'][:2000]}\n    --------------")
+
+        recovery_attempts_total += attempt
+        if verifier.all_passed(results):
+            log_fn(f"{label}[완료] {f}: 검증 통과")
+        else:
+            all_passed_final = False
+            log_fn(f"{label}[실패] {f}: {max_retries}회 시도 후에도 검증 실패. 백업: {backup_path}")
+
+    return {
+        "success": all_passed_final,
+        "reason": "completed" if all_passed_final else "completed_with_failures",
+        "verify_ran": verify_ran,
+        "all_passed_final": all_passed_final,
+        "recovery_attempts_total": recovery_attempts_total,
+    }
+
+
+def _delegate_openrouter(task: str, files: list[str], file_contents: dict[str, str],
+                         work_root: str, hook_roots, cfg: dict, log_fn,
+                         guide: str = "") -> dict:
+    """OpenRouter가 켜져 있으면 외부 CLI 대신 먼저 코딩 파이프라인을 시도한다."""
+    llm = _build_openrouter_llm(cfg)
+    if llm is None:
+        return {"attempted": False, "success": False, "reason": "disabled"}
+    log_fn("[OpenRouter] 위임을 먼저 시도합니다.")
+    if not llm.health_check():
+        log_fn("[OpenRouter] 연결 실패 또는 API 키 없음. 외부 도구로 폴백합니다.")
+        return {"attempted": True, "success": False, "reason": "health_check_failed"}
+    try:
+        result = _run_change_pipeline(
+            llm, task, files, file_contents, work_root, hook_roots, cfg, log_fn,
+            guide=guide, step_prefix="[OpenRouter]",
+        )
+    except Exception as exc:
+        log_fn(f"[OpenRouter] 실패: {exc}. 외부 도구로 폴백합니다.")
+        return {"attempted": True, "success": False, "reason": "exception"}
+    result["attempted"] = True
+    if result.get("success"):
+        log_fn("[OpenRouter] 작업 완료")
+    else:
+        log_fn(f"[OpenRouter] 완료하지 못함({result.get('reason')}). 외부 도구로 폴백합니다.")
+    return result
 
 
 EXPLAIN_PROMPT = """다음은 사용자의 질문과 관련 코드다.
@@ -156,6 +326,7 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     """작업을 실행한다.
 
     force: None/"auto" → 자동 라우팅, "local" → 로컬 LLM 강제,
+           "openrouter" → OpenRouter 강제,
            "claude" → Claude Code 강제, "codex" → Codex 강제.
     confirm_fn: 외부 도구 변경을 파일에 적용할지 묻는 콜백. None이면 TTY 입력(_default_confirm).
     """
@@ -209,12 +380,20 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
         _rec("external", "forced_external", tool=tool)
         return
 
-    main_llm = _build_main_llm(cfg)
+    if force == "local":
+        main_llm = _build_local_llm(cfg)
+    elif force == "openrouter":
+        main_llm = _build_openrouter_llm(cfg)
+    else:
+        main_llm = _build_main_llm(cfg)
 
     if force == "local" and main_llm is None:
-        log_fn("[오류] local_llm과 openrouter가 모두 비활성화되어 있습니다. "
-               "config.yaml에서 둘 중 하나는 enabled: true로 설정하세요.")
+        log_fn("[오류] local_llm이 config.yaml에서 비활성화되어 있습니다.")
         _rec("n/a", "local_disabled")
+        return
+    if force == "openrouter" and main_llm is None:
+        log_fn("[오류] openrouter가 config.yaml에서 비활성화되어 있습니다 (openrouter.enabled: false).")
+        _rec("n/a", "openrouter_disabled")
         return
 
     # 파이프라인 백엔드(local_llm/openrouter)가 모두 비활성화된 경우: 바로 외부로 위임한다.
@@ -233,7 +412,15 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
 
     if not main_llm.health_check():
         if isinstance(main_llm, OpenRouterLLM):
-            log_fn("[오류] OpenRouter에 연결할 수 없습니다. config.yaml의 openrouter.api_key를 확인하세요.")
+            tool = pick_external_tool(cfg)
+            if tool is None:
+                log_fn("[오류] OpenRouter에 연결할 수 없고 활성화된 외부 도구도 없습니다. "
+                       "config.yaml의 openrouter.api_key 또는 external_tools 설정을 확인하세요.")
+                _rec("n/a", "openrouter_unavailable_no_tool")
+                return
+            log_fn(f"[OpenRouter] 연결 실패 또는 API 키 없음 → 외부 도구로 위임: {tool}")
+            _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
+            _rec("external", "openrouter_unavailable_external", tool=tool)
         else:
             log_fn("[오류] Ollama 서버에 연결할 수 없습니다. 'ollama serve'가 실행 중인지 확인하세요.")
         return
@@ -243,7 +430,7 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     # 설명/질문형 작업은 수정 파이프라인 대신 읽기 전용 설명 모드로 처리한다.
     if force != "claude" and force != "codex" and _looks_like_question(task):
         explain_task(main_llm, task, work_root, exclude_dirs, log_fn, guide=guide)
-        _rec("local", "explain")
+        _rec("openrouter" if force == "openrouter" else "local", "explain")
         return
 
     # 코딩 작업이 아닌 일상대화/잡담은 파이프라인 진입 전에 즉시 걸러낸다.
@@ -267,152 +454,90 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     file_contents = context.read_files(work_root, files)
     est_tokens = context.estimate_tokens(file_contents)
 
-    # Step 2: 라우팅 판단 (force == "local"이면 라우팅을 건너뛰고 로컬 강제)
-    if force == "local":
-        decision = {"decision": "local", "reason": "사용자 지정(/model local)", "tool": None}
+    # Step 2: 라우팅 판단 (force == "local/openrouter"이면 라우팅을 건너뛰고 해당 LLM 강제)
+    if force in ("local", "openrouter"):
+        decision = {"decision": "local", "reason": f"사용자 지정(/model {force})", "tool": None}
     else:
         router = Router(main_llm, cfg, guide=guide)
         decision = router.decide(task, len(files), est_tokens)
     log_fn(f"[2/6] 라우팅 결정: {decision}")
 
     if decision["decision"] == "external":
+        or_result = _delegate_openrouter(task, files, file_contents, work_root, hook_roots, cfg, log_fn, guide=guide)
+        if or_result.get("success"):
+            _rec("openrouter", "auto_openrouter", est_tokens=est_tokens, files=len(files),
+                 verify_ran=or_result.get("verify_ran", False),
+                 all_passed_final=or_result.get("all_passed_final", True),
+                 recovery_attempts_total=or_result.get("recovery_attempts_total", 0))
+            log_fn("\n[작업 종료]")
+            return
+
         tool = decision.get("tool") or pick_external_tool(cfg)
         if tool is None:
-            log_fn("[오류] 활성화된 외부 도구가 없습니다. config.yaml의 external_tools에서 하나를 enabled: true로 설정하세요.")
-            _rec("n/a", "no_enabled_tool", est_tokens=est_tokens, files=len(files))
+            if or_result.get("attempted"):
+                log_fn("[오류] OpenRouter 위임이 실패했고 활성화된 외부 도구도 없습니다.")
+            else:
+                log_fn("[오류] 활성화된 외부 도구가 없습니다. config.yaml의 external_tools에서 하나를 enabled: true로 설정하세요.")
+            _rec("n/a", "no_enabled_tool", est_tokens=est_tokens, files=len(files),
+                 openrouter_attempted=or_result.get("attempted", False))
             return
-        log_fn(f"[2/6] 외부 도구로 위임: {tool}")
-        _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
-        _rec("external", "auto_external", tool=tool, est_tokens=est_tokens, files=len(files))
-        return
-
-    # Step 3: 계획 수립
-    log_fn("[3/6] 계획 수립 중...")
-    plan = planner.make_plan(main_llm, task, file_contents, guide=guide)
-
-    if not plan["changes"]:
-        log_fn("[안내] 수행할 변경 사항이 없습니다.")
-        log_fn("        작업을 더 구체적으로 적거나, 설명이 목적이면 /model claude 를 사용하세요.")
-        _rec("local", "no_changes", est_tokens=est_tokens, files=len(files))
-        return
-
-    # 검증 게이트: 계획의 file 경로를 선택된 파일에 맞춰 보정/폐기한다.
-    # 로컬 모델이 경로를 변조하거나 범위 밖 파일을 지어내면 여기서 걸러진다.
-    plan["changes"], dropped = planner.validate_changes(plan["changes"], files)
-    for raw, why in dropped:
-        log_fn(f"[검증] 변경 항목 폐기: {raw!r} ({why})")
-
-    # 살릴 변경이 하나도 없으면 로컬은 신뢰 불가 → 외부 도구로 자동 폴백.
-    if not plan["changes"]:
-        tool = pick_external_tool(cfg)
-        if tool is None:
-            log_fn("[안내] 수행할 변경 사항이 없고, 활성화된 외부 도구도 없습니다.")
-            _rec("n/a", "no_changes_no_tool", est_tokens=est_tokens, files=len(files))
-            return
-        log_fn(f"[폴백] 로컬 계획이 유효한 변경을 만들지 못해 외부 도구로 위임: {tool}")
-        _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
-        _rec("external", "local_fallback", tool=tool, est_tokens=est_tokens, files=len(files))
-        return
-
-    # 작업이 파일명을 콕 집었는데 계획이 그 파일을 안 건드리면 탈선 → 외부 폴백.
-    missing = planner.untouched_targets(task, files, plan["changes"])
-    if missing:
-        tool = pick_external_tool(cfg)
-        if tool is None:
-            log_fn(f"[안내] 작업이 지정한 파일을 계획이 건드리지 않았고({missing}), 활성화된 외부 도구도 없습니다.")
-            _rec("n/a", "offtarget_no_tool", est_tokens=est_tokens, files=len(files))
-            return
-        log_fn(f"[폴백] 작업이 지정한 파일을 계획이 건드리지 않음({missing}) → 외부 도구로 위임: {tool}")
-        _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
-        _rec("external", "local_offtarget", tool=tool, est_tokens=est_tokens, files=len(files))
-        return
-
-    for c in plan["changes"]:
-        log_fn(f"  - {c['action']}: {c['file']} :: {c['description']}")
-
-    # Step 4 & 5 & 6: 변경 적용 -> 검증 -> 자동 복구
-    backup_dir = cfg["harness"]["backup_dir"]
-    max_retries = cfg["harness"]["max_recovery_retries"]
-    timeout = cfg["harness"]["verify_timeout_sec"]
-
-    verify_ran = False
-    all_passed_final = True
-    recovery_attempts_total = 0
-
-    for change in plan["changes"]:
-        f = change["file"]
-        current = file_contents.get(f, "")
-        log_fn(f"\n[4/6] 변경 생성 중: {f}")
-        new_content, diff = executor.generate_change(main_llm, f, current, change["description"])
-        log_fn(diff if diff.strip() else "(diff 없음 - 새 파일)")
-
-        try:
-            hooks.check_pre_file(hook_roots, f)
-        except hooks.HookBlocked as e:
-            log_fn(f"[차단됨] {f} 변경을 건너뜁니다: {e.message}")
-            continue
-
-        try:
-            backup_path = executor.apply_change(work_root, f, new_content, backup_dir)
-        except executor.PathEscapeError:
-            log_fn(f"[차단] {f}: 작업 폴더(work_root) 밖 경로라 적용을 거부했습니다.")
-            all_passed_final = False
-            continue
-        log_fn(f"[4/6] 적용 완료: {f} (백업: {backup_path})")
-
-        post_edit_output = hooks.run_post_edit(hook_roots, f)
-        if post_edit_output:
-            log_fn(f"[post-edit] {post_edit_output}")
-
-        # Step 5: 검증
-        verify_cmds = plan.get("verify_commands", [])
-        if not verify_cmds:
-            log_fn("[5/6] 검증 명령 없음, 건너뜀")
-            continue
-
-        log_fn("[5/6] 검증 실행 중...")
-        blocked = False
-        for cmd in verify_cmds:
-            try:
-                hooks.check_pre_bash(hook_roots, cmd)
-            except hooks.HookBlocked as e:
-                log_fn(f"[차단됨] 검증 명령 차단: {e.message}")
-                blocked = True
-        if blocked:
-            continue
-
-        results = verifier.run_verification(verify_cmds, work_root, timeout)
-        verify_ran = True
-        for r in results:
-            log_fn(f"  $ {r['cmd']} -> {'OK' if r['success'] else 'FAIL'}")
-            if not r["success"]:
-                log_fn(f"    --- output ---\n{r['output'][:2000]}\n    --------------")
-
-        # Step 6: 자동 복구
-        attempt = 0
-        while not verifier.all_passed(results) and attempt < max_retries:
-            attempt += 1
-            failed = next(r for r in results if not r["success"])
-            log_fn(f"[6/6] 검증 실패, 자동 복구 시도 {attempt}/{max_retries}")
-            with open(f"{work_root}/{f}", "r", encoding="utf-8") as fp:
-                cur = fp.read()
-            recovery.recover_file(main_llm, work_root, f, cur, failed)
-            results = verifier.run_verification(verify_cmds, work_root, timeout)
-            for r in results:
-                log_fn(f"  $ {r['cmd']} -> {'OK' if r['success'] else 'FAIL'}")
-                if not r["success"]:
-                    log_fn(f"    --- output ---\n{r['output'][:2000]}\n    --------------")
-
-        recovery_attempts_total += attempt
-        if verifier.all_passed(results):
-            log_fn(f"[완료] {f}: 검증 통과")
+        if or_result.get("attempted"):
+            log_fn(f"[2/6] OpenRouter 실패 후 외부 도구로 위임: {tool}")
         else:
-            all_passed_final = False
-            log_fn(f"[실패] {f}: {max_retries}회 시도 후에도 검증 실패. 백업: {backup_path}")
+            log_fn(f"[2/6] OpenRouter 비활성화 → 외부 도구로 위임: {tool}")
+        _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
+        _rec("external", "auto_external", tool=tool, est_tokens=est_tokens, files=len(files),
+             openrouter_attempted=or_result.get("attempted", False))
+        return
 
-    _rec("local", "completed", est_tokens=est_tokens, files=len(files),
-         verify_ran=verify_ran, all_passed_final=all_passed_final,
-         recovery_attempts_total=recovery_attempts_total)
+    local_result = _run_change_pipeline(
+        main_llm, task, files, file_contents, work_root, hook_roots, cfg, log_fn, guide=guide,
+    )
+    if not local_result.get("success"):
+        if force == "openrouter":
+            tool = pick_external_tool(cfg)
+            if tool is None:
+                log_fn("[안내] OpenRouter가 작업을 완료하지 못했고, 활성화된 외부 도구도 없습니다.")
+                _rec("n/a", "openrouter_fallback_no_tool", est_tokens=est_tokens, files=len(files),
+                     openrouter_reason=local_result.get("reason"))
+                return
+            log_fn(f"[폴백] OpenRouter 실패 후 외부 도구로 위임: {tool}")
+            _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
+            _rec("external", "openrouter_fallback_external", tool=tool, est_tokens=est_tokens, files=len(files),
+                 openrouter_reason=local_result.get("reason"))
+            return
+
+        or_result = _delegate_openrouter(task, files, file_contents, work_root, hook_roots, cfg, log_fn, guide=guide)
+        if or_result.get("success"):
+            _rec("openrouter", "local_fallback_openrouter", est_tokens=est_tokens, files=len(files),
+                 local_reason=local_result.get("reason"),
+                 verify_ran=or_result.get("verify_ran", False),
+                 all_passed_final=or_result.get("all_passed_final", True),
+                 recovery_attempts_total=or_result.get("recovery_attempts_total", 0))
+            log_fn("\n[작업 종료]")
+            return
+
+        tool = pick_external_tool(cfg)
+        if tool is None:
+            log_fn("[안내] 로컬/OpenRouter가 작업을 완료하지 못했고, 활성화된 외부 도구도 없습니다.")
+            _rec("n/a", "fallback_no_tool", est_tokens=est_tokens, files=len(files),
+                 local_reason=local_result.get("reason"),
+                 openrouter_attempted=or_result.get("attempted", False))
+            return
+        if or_result.get("attempted"):
+            log_fn(f"[폴백] OpenRouter 실패 후 외부 도구로 위임: {tool}")
+        else:
+            log_fn(f"[폴백] OpenRouter 비활성화 → 외부 도구로 위임: {tool}")
+        _delegate_external(tool, task, hook_roots, work_root, log_fn, confirm_fn)
+        _rec("external", "local_fallback_external", tool=tool, est_tokens=est_tokens, files=len(files),
+             local_reason=local_result.get("reason"),
+             openrouter_attempted=or_result.get("attempted", False))
+        return
+
+    _rec("openrouter" if force == "openrouter" else "local", "completed", est_tokens=est_tokens, files=len(files),
+         verify_ran=local_result.get("verify_ran", False),
+         all_passed_final=local_result.get("all_passed_final", True),
+         recovery_attempts_total=local_result.get("recovery_attempts_total", 0))
     log_fn("\n[작업 종료]")
 
 
