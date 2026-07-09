@@ -308,6 +308,8 @@ def _is_general_information_request(task: str) -> bool:
     if not task:
         return False
     t = task.lower()
+    if "내 프로젝트" in t or "프로젝트 설명" in t or "프로젝트 1문장" in t:
+        return False
     patterns = (
         "너에대해", "너는", "너의", "뭐야", "뭐니", "무슨", "어떤", "어떻게", "설명해줘",
         "설명해", "알려줘", "알려주", "openrouter", "ollama", "claude", "codex",
@@ -539,7 +541,10 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
                 log_fn(f"[오류] 설명 생성 실패: {exc}")
                 log_fn("        OpenRouter 모델명/API 키/컨텍스트 제한을 확인하세요.")
                 return
-            log_fn(answer if isinstance(answer, str) else str(answer))
+            if isinstance(answer, str) and answer.strip():
+                log_fn(answer)
+            else:
+                log_fn("[안내] 모델이 빈 답변을 반환했습니다. 잠시 후 다시 시도해 주세요.")
             _rec("openrouter" if force == "openrouter" else "local", "explain")
             return
         explain_task(main_llm, task, work_root, exclude_dirs, log_fn, guide=guide)
