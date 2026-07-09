@@ -128,13 +128,26 @@ def _run_change_pipeline(llm, task: str, files: list[str], file_contents: dict[s
     """
     label = f"{step_prefix} " if step_prefix else ""
     log_fn(f"{label}[계획] 변경 계획 수립 중...")
-    plan = planner.make_plan(llm, task, file_contents, guide=guide)
+    try:
+        plan = planner.make_plan(llm, task, file_contents, guide=guide)
+    except Exception as exc:
+        log_fn(f"{label}[오류] 계획 생성 실패: {exc}")
+        return {"success": False, "reason": "plan_failed", "error": str(exc)}
 
-    if not plan["changes"]:
+    if not isinstance(plan, dict):
+        log_fn(f"{label}[오류] 계획 응답 형식이 올바르지 않습니다: {plan!r}")
+        return {"success": False, "reason": "plan_failed", "error": "invalid_plan_type"}
+
+    changes = plan.get("changes") or []
+    if not isinstance(changes, list):
+        log_fn(f"{label}[오류] 계획의 changes가 배열이 아닙니다: {changes!r}")
+        return {"success": False, "reason": "plan_failed", "error": "invalid_changes_type"}
+
+    if not changes:
         log_fn(f"{label}[안내] 수행할 변경 사항이 없습니다.")
         return {"success": False, "reason": "no_changes"}
 
-    plan["changes"], dropped = planner.validate_changes(plan["changes"], files)
+    plan["changes"], dropped = planner.validate_changes(changes, files)
     for raw, why in dropped:
         log_fn(f"{label}[검증] 변경 항목 폐기: {raw!r} ({why})")
 
@@ -273,32 +286,110 @@ EXPLAIN_PROMPT = """다음은 사용자의 질문과 관련 코드다.
 
 코드를 바탕으로 한국어로 명확하게 설명해라. 코드를 수정하지 말고 설명만 해라."""
 
+_EXPLAIN_MAX_FILE_CHARS = 12000
+_EXPLAIN_MAX_TOTAL_CHARS = 36000
+
 # 설명/질문 의도를 나타내는 키워드 (수정 키워드가 함께 있으면 수정으로 본다)
-_EXPLAIN_HINTS = ("설명", "분석", "무슨", "뭐하는", "뭐야", "어떻게 동작", "동작 방식",
+_EXPLAIN_HINTS = ("설명", "분석", "무슨", "뭐하는", "뭐야", "뭐니", "어떻게 동작", "동작 방식",
                   "왜", "알려줘", "요약", "explain", "what is", "what does", "describe", "summar")
 _EDIT_HINTS = ("추가", "수정", "고쳐", "고쳐줘", "바꿔", "변경", "구현", "리팩토", "삭제", "제거",
                "생성", "만들어", "작성", "fix", "add", "implement", "refactor", "create", "remove")
 
 _CODE_EXTS = (".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".java", ".rs",
-              ".c", ".cc", ".cpp", ".h", ".rb", ".php", ".kt", ".swift")
+              ".c", ".cc", ".cpp", ".h", ".rb", ".php", ".kt", ".swift",
+              ".cs", ".csproj", ".sln", ".md")
+_SUMMARY_HINTS = ("프로젝트", "폴더", "간략", "요약", "뭐하는", "무슨", "summary", "overview")
+_SUMMARY_PRIORITY = ("readme.md", ".sln", ".csproj", "package.json", "pyproject.toml",
+                     "pom.xml", "build.gradle", "settings.gradle")
+
+
+def _is_general_information_request(task: str) -> bool:
+    """자기소개·백엔드·도구 개념 질문처럼 프로젝트 코드가 아닌 일반 지식/설명 요청인지 판별한다."""
+    if not task:
+        return False
+    t = task.lower()
+    patterns = (
+        "너에대해", "너는", "너의", "뭐야", "뭐니", "무슨", "어떤", "어떻게", "설명해줘",
+        "설명해", "알려줘", "알려주", "openrouter", "ollama", "claude", "codex",
+        "agent", "ai agent", "에이전트", "백엔드", "모델", "api key"
+    )
+    return any(p in t for p in patterns)
 
 
 def _looks_like_question(task: str) -> bool:
     """설명/질문형 작업이면 True. 수정 키워드가 있으면 수정 작업으로 간주한다."""
+    if not task:
+        return False
     t = task.lower()
     if any(k in task or k in t for k in _EDIT_HINTS):
         return False
-    return any(k in task or k in t for k in _EXPLAIN_HINTS)
+    if any(k in task or k in t for k in _EXPLAIN_HINTS):
+        return True
+    return bool(t.endswith("?")) or bool(t.endswith("요?")) or bool(t.endswith("니?")) or bool(t.endswith("야?"))
 
 
 def _fallback_read_files(task: str, tree_paths: list) -> list:
-    """파일 선택이 비었을 때의 대체 선택. 작업에 명시된 파일명 → 소스 코드 파일 순."""
-    mentioned = [p for p in tree_paths
-                 if os.path.basename(p) in task or p in task]
+    """파일 선택이 비었을 때의 대체 선택.
+
+    작업에 명시된 파일/폴더명 → 프로젝트 요약용 메타 파일 → 소스 코드 파일 순.
+    """
+    task_l = (task or "").lower()
+    mentioned = [
+        p for p in tree_paths
+        if os.path.basename(p).lower() in task_l
+        or p.lower() in task_l
+        or any(part and part.lower() in task_l for part in p.split(os.sep)[:-1])
+    ]
     if mentioned:
-        return mentioned[:5]
+        return _rank_summary_files(mentioned)[:5]
+    if any(h in task_l for h in _SUMMARY_HINTS):
+        summary = _rank_summary_files(tree_paths)
+        if summary:
+            return summary[:5]
     code = [p for p in tree_paths if p.endswith(_CODE_EXTS)]
     return code[:5]
+
+
+def _rank_summary_files(paths: list[str]) -> list[str]:
+    """프로젝트 설명에 도움이 되는 파일을 앞으로 정렬한다."""
+    def score(path: str) -> tuple[int, str]:
+        lower = path.lower()
+        base = os.path.basename(lower)
+        for idx, pat in enumerate(_SUMMARY_PRIORITY):
+            if base == pat or lower.endswith(pat):
+                return (idx, lower)
+        if lower.endswith(".md"):
+            return (20, lower)
+        if lower.endswith((".csproj", ".sln")):
+            return (30, lower)
+        if lower.endswith(".cs"):
+            return (40, lower)
+        if lower.endswith(_CODE_EXTS):
+            return (50, lower)
+        return (100, lower)
+
+    ranked = [p for p in paths if score(p)[0] < 100]
+    return sorted(ranked, key=score)
+
+
+def _format_explain_contents(file_contents: dict[str, str]) -> str:
+    """설명 모드 프롬프트가 너무 커지지 않게 파일별/전체 길이를 제한한다."""
+    parts = []
+    used = 0
+    for f, content in file_contents.items():
+        if not content:
+            continue
+        remaining = _EXPLAIN_MAX_TOTAL_CHARS - used
+        if remaining <= 0:
+            break
+        limit = min(_EXPLAIN_MAX_FILE_CHARS, remaining)
+        clipped = content[:limit]
+        if len(content) > limit:
+            clipped += f"\n\n... (이하 {len(content) - limit}자 생략)"
+        block = f"### {f}\n```\n{clipped}\n```"
+        parts.append(block)
+        used += len(clipped)
+    return "\n\n".join(parts) or "(파일 내용을 읽지 못했습니다)"
 
 
 def explain_task(llm, task: str, work_root: str, exclude_dirs, log_fn, guide: str = "") -> None:
@@ -314,12 +405,21 @@ def explain_task(llm, task: str, work_root: str, exclude_dirs, log_fn, guide: st
 
     log_fn(f"[설명 모드] 읽는 파일: {files}")
     file_contents = context.read_files(work_root, files)
-    contents_str = "\n\n".join(
-        f"### {f}\n```\n{c}\n```" for f, c in file_contents.items() if c
-    ) or "(파일 내용을 읽지 못했습니다)"
-    answer = llm.generate(EXPLAIN_PROMPT.format(task=task, file_contents=contents_str))
+    contents_str = _format_explain_contents(file_contents)
+    try:
+        answer = llm.generate(EXPLAIN_PROMPT.format(task=task, file_contents=contents_str))
+    except Exception as exc:
+        log_fn(f"[오류] 설명 생성 실패: {exc}")
+        log_fn("        OpenRouter 모델명/API 키/컨텍스트 제한을 확인하세요.")
+        return
     log_fn("")
-    log_fn(answer if isinstance(answer, str) else str(answer))
+    if isinstance(answer, str):
+        if answer.strip():
+            log_fn(answer)
+        else:
+            log_fn("[안내] 모델이 빈 답변을 반환했습니다. 잠시 후 다시 시도하거나 /model claude 로 위임해 보세요.")
+    else:
+        log_fn(str(answer) if answer is not None else "[안내] 모델이 빈 답변을 반환했습니다. 잠시 후 다시 시도하거나 /model claude 로 위임해 보세요.")
 
 
 def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confirm_fn=None):
@@ -429,6 +529,19 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
 
     # 설명/질문형 작업은 수정 파이프라인 대신 읽기 전용 설명 모드로 처리한다.
     if force != "claude" and force != "codex" and _looks_like_question(task):
+        if _is_general_information_request(task):
+            try:
+                answer = main_llm.generate(
+                    f"사용자 질문: {task}\n\n당신은 AI 에이전트의 설명자다. 짧고 명확하게 한국어로 답해라. 프로젝트 파일을 읽지 말고, 일반적인 의미로 설명해라.",
+                    num_predict=200,
+                )
+            except Exception as exc:
+                log_fn(f"[오류] 설명 생성 실패: {exc}")
+                log_fn("        OpenRouter 모델명/API 키/컨텍스트 제한을 확인하세요.")
+                return
+            log_fn(answer if isinstance(answer, str) else str(answer))
+            _rec("openrouter" if force == "openrouter" else "local", "explain")
+            return
         explain_task(main_llm, task, work_root, exclude_dirs, log_fn, guide=guide)
         _rec("openrouter" if force == "openrouter" else "local", "explain")
         return

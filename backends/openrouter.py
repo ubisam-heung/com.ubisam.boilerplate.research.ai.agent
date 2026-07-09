@@ -31,18 +31,39 @@ class OpenRouterLLM:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        resp = requests.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=300,
-        )
-        resp.raise_for_status()
+        resp = self._post_chat(payload)
+        if not resp.ok and json_mode and resp.status_code == 400 and "response_format" in payload:
+            # Some OpenRouter providers reject response_format even when the model can return JSON.
+            # Retry without strict JSON mode and parse the text ourselves below.
+            fallback_payload = dict(payload)
+            fallback_payload.pop("response_format", None)
+            resp = self._post_chat(fallback_payload)
+
+        if not resp.ok:
+            raise self._http_error(resp)
         text = resp.json()["choices"][0]["message"]["content"]
 
         if json_mode:
             return self._parse_json(text)
         return text
+
+    def _post_chat(self, payload: dict):
+        return requests.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=300,
+        )
+
+    @staticmethod
+    def _http_error(resp):
+        detail = resp.text.strip()
+        if len(detail) > 1000:
+            detail = detail[:1000] + "..."
+        return requests.HTTPError(
+            f"OpenRouter HTTP {resp.status_code}: {detail}",
+            response=resp,
+        )
 
     @staticmethod
     def _parse_json(text: str):

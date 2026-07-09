@@ -15,8 +15,27 @@ CHATTER_REPLY_PROMPT = """사용자가 일상적인 말을 건넸다. 코딩 에
 사용자 입력: {task}"""
 
 
+_OBVIOUS_CHATTER = {
+    "안녕", "안녕하세요", "하이", "hi", "hello", "hey",
+    "고마워", "감사", "감사합니다", "thanks", "thank you",
+    "ㅇㅋ", "오케이", "ok", "okay", "넵", "네", "응",
+    "잘가", "바이", "bye",
+}
+
+
+def _is_obvious_chatter(task: str) -> bool:
+    """짧고 명확한 인사/감사/응답은 LLM 판정 전에 잡담으로 확정한다."""
+    text = (task or "").strip().lower()
+    if not text:
+        return True
+    normalized = text.rstrip("!?.。！？~ \t")
+    return normalized in _OBVIOUS_CHATTER
+
+
 def is_chatter(llm, task: str) -> bool:
     """코딩 작업이 아닌 일상대화/잡담이면 True를 반환한다."""
+    if _is_obvious_chatter(task):
+        return True
     try:
         result = llm.generate(CHATTER_CHECK_PROMPT.format(task=task), json_mode=True, num_predict=32)
         return not result.get("is_task", True)
