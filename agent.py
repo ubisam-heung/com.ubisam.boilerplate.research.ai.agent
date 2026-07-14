@@ -121,7 +121,7 @@ def _delegate_external(tool: str, task: str, hook_roots, run_root: str, log_fn, 
 
 def _run_agentic(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
                   guide: str = "", mode: str = agentic_loop.DEFAULT_MODE, confirm_fn=None,
-                  label: str = "") -> dict:
+                  label: str = "", conversation_history: list[str] | None = None) -> dict:
     """주어진 LLM(local 또는 openrouter)으로 agentic_loop를 실행한다.
 
     local/external 구분 없이 모든 백엔드가 이 함수 하나를 거친다. 모델이
@@ -133,7 +133,7 @@ def _run_agentic(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
     try:
         result = agentic_loop.run_loop(
             llm, task, work_root, hook_roots, cfg, log_fn, guide=guide,
-            mode=mode, confirm_fn=confirm_fn,
+            mode=mode, confirm_fn=confirm_fn, conversation_history=conversation_history,
         )
     except Exception as exc:
         log_fn(f"{label}[오류] 에이전틱 루프 실패: {exc}")
@@ -301,7 +301,7 @@ def explain_task(llm, task: str, work_root: str, exclude_dirs, log_fn, guide: st
 
 
 def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confirm_fn=None,
-              mode: str = agentic_loop.DEFAULT_MODE):
+              mode: str = agentic_loop.DEFAULT_MODE, conversation_history: list[str] | None = None):
     """작업을 실행한다.
 
     force: None/"auto" → 자동 라우팅, "local" → 로컬 LLM 강제,
@@ -310,6 +310,8 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     confirm_fn: 파일 변경/명령 실행/외부 도구 적용을 승인할지 묻는 콜백. None이면 TTY 입력(_default_confirm).
     mode: "manual"(전부 승인) | "edit-only"(파일수정 자동, 명령만 승인) | "auto"(전부 자동).
           agentic_loop의 write_file/run_command 승인 여부를 결정한다.
+    conversation_history: 같은 대화형 세션의 직전 턴 입력들(오래된 것부터). "이번에
+          추가한 기능"처럼 직전 맥락을 참조하는 후속 질문을 이해하도록 agentic_loop에 전달된다.
     """
     if log_fn is None:
         log_fn = print
@@ -446,6 +448,7 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     result = _run_agentic(
         main_llm, task, work_root, hook_roots, cfg, log_fn, guide=guide,
         mode=mode, confirm_fn=confirm_fn, label="[3/3] ",
+        conversation_history=conversation_history,
     )
 
     if result.get("success"):

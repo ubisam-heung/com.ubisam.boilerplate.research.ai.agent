@@ -481,12 +481,14 @@ def run_interactive(project_dir: str = "."):
             def _rec_log(msg: str, _r=recorder):
                 _r.append(msg)
                 _rich_log(msg)
-            _run_task(task, project_dir, ui["model"], log_fn=_rec_log, mode=ui["mode"])
+            _run_task(task, project_dir, ui["model"], log_fn=_rec_log, mode=ui["mode"],
+                      conversation_history=history[:-1])
             recorder.end_turn()
             _autosave(recorder)
         else:
             # 내부 호환용 auto: run_agent가 local_llm -> OpenRouter -> external_tools 순서로 라우팅한다.
-            _run_auto_mode(task, project_dir, config, recorder, pending_preamble, mode=ui["mode"])
+            _run_auto_mode(task, project_dir, config, recorder, pending_preamble, mode=ui["mode"],
+                           conversation_history=history[:-1])
 
     # 세션 종료 시 자동 저장
     saved = recorder.save(status="ended")
@@ -709,7 +711,7 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
 
 
 def _run_task(task: str, project_dir: str, model: str = "auto", log_fn=None,
-              mode: str = agentic_loop.DEFAULT_MODE):
+              mode: str = agentic_loop.DEFAULT_MODE, conversation_history: Optional[List[str]] = None):
     label = task if len(task) <= 55 else task[:52] + "..."
     console.print()
     console.print(Rule(f"[dim]{escape(label)}[/dim]", style="dim blue"))
@@ -719,7 +721,8 @@ def _run_task(task: str, project_dir: str, model: str = "auto", log_fn=None,
     start = time.monotonic()
     try:
         from agent import run_agent
-        run_agent(task, root=project_dir, log_fn=effective_log, force=force, confirm_fn=_rich_confirm, mode=mode)
+        run_agent(task, root=project_dir, log_fn=effective_log, force=force, confirm_fn=_rich_confirm, mode=mode,
+                  conversation_history=conversation_history)
     except KeyboardInterrupt:
         console.print("\n  [yellow]⚠[/yellow]  작업이 중단되었습니다.")
     except Exception as exc:
@@ -754,7 +757,8 @@ def _is_obviously_coding(task: str) -> bool:
 
 
 def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionRecorder,
-                    pending_preamble: Optional[dict] = None, mode: str = agentic_loop.DEFAULT_MODE):
+                    pending_preamble: Optional[dict] = None, mode: str = agentic_loop.DEFAULT_MODE,
+                    conversation_history: Optional[List[str]] = None):
     """auto 모드: local_llm이 먼저 받고, 필요할 때 OpenRouter/외부 도구 순으로 폴백한다."""
     if pending_preamble and pending_preamble.get("text"):
         recorder.append("[안내] auto 모드에서는 이전 외부 대화 요약을 직접 주입하지 않습니다.")
@@ -764,7 +768,7 @@ def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionR
         _r.append(msg)
         _rich_log(msg)
 
-    _run_task(task, project_dir, "auto", log_fn=_rec_log, mode=mode)
+    _run_task(task, project_dir, "auto", log_fn=_rec_log, mode=mode, conversation_history=conversation_history)
     recorder.end_turn()
     _autosave(recorder)
 

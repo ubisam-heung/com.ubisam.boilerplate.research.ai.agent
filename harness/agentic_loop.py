@@ -30,7 +30,7 @@ DEFAULT_MODE = "edit-only"
 SYSTEM_PROMPT = """당신은 코딩 에이전트다. 아래 도구를 매 턴 하나씩 호출해서
 작업을 완료해라. 파일 내용을 추측하지 말고, 필요하면 반드시 read_file이나
 grep으로 먼저 확인해라.
-
+{conversation}
 작업: {task}
 작업 루트: {work_root} (모든 경로는 이 루트 기준 상대경로)
 {guide}
@@ -225,7 +225,8 @@ def _dispatch(action: dict, work_root: str, hook_roots, cfg: dict, log_fn,
 
 def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
              guide: str = "", max_steps: int | None = None,
-             mode: str = DEFAULT_MODE, confirm_fn=None) -> dict:
+             mode: str = DEFAULT_MODE, confirm_fn=None,
+             conversation_history: list[str] | None = None) -> dict:
     """에이전틱 루프를 실행한다.
 
     모델이 매 스텝 도구 호출 JSON을 하나 반환하면 실행하고 결과를 이력에
@@ -233,10 +234,18 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
 
     mode: "manual"(전부 승인) | "edit-only"(파일수정 자동, 명령만 승인)
           | "auto"(전부 자동). confirm_fn: 승인 질문(question:str) -> bool.
+    conversation_history: 같은 대화형 세션의 직전 턴 입력들(최신순 아님, 오래된 것부터).
+          "이번에 추가한 기능"처럼 이전 턴을 참조하는 후속 질문을 모델이 이해하도록
+          시스템 프롬프트에 짧게 얹는다. None/빈 리스트면 생략.
     """
     max_steps = max_steps or cfg.get("harness", {}).get("agentic_max_steps", MAX_STEPS_DEFAULT)
+    conv_text = ""
+    if conversation_history:
+        recent = conversation_history[-5:]
+        lines = "\n".join(f"- {t}" for t in recent)
+        conv_text = f"\n직전 대화(최근 순서대로, 참고용 — 현재 작업이 여기서 이어지는 것일 수 있다):\n{lines}\n"
     system = SYSTEM_PROMPT.format(
-        task=task, work_root=work_root,
+        task=task, work_root=work_root, conversation=conv_text,
         guide=f"\n프로젝트 지침:\n{guide}\n" if guide else "",
     )
 

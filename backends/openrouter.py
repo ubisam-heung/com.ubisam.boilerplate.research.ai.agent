@@ -43,7 +43,12 @@ class OpenRouterLLM:
 
         if not resp.ok:
             raise self._http_error(resp)
-        text = resp.json()["choices"][0]["message"]["content"]
+        body = resp.json()
+        choice = body["choices"][0]
+        text = choice["message"]["content"]
+        if text is None:
+            reason = choice.get("finish_reason", "unknown")
+            raise ValueError(f"OpenRouter가 빈 응답을 반환했습니다 (finish_reason={reason}): {json.dumps(body)[:500]}")
 
         if json_mode:
             return self._parse_json(text)
