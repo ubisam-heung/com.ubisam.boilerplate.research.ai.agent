@@ -73,21 +73,6 @@ FILE_SELECTION_PROMPT = """{guide}다음은 프로젝트의 파일 목록이다:
 JSON 배열로만 답해라. 예: ["src/api/routes.py", "src/models/user.py"]
 """
 
-FILE_CONFIRM_PROMPT = """{guide}작업: {task}
-
-아래는 1차로 선택한 파일들의 실제 내용이다:
-{contents}
-
-나머지 프로젝트 파일 목록(1차 선택에 없던 것들):
-{remaining_tree}
-
-이 내용만으로 작업 계획을 세우기에 충분한지 판단해라.
-부족하면 나머지 파일 목록 중에서 추가로 읽어야 할 파일을 최대 3개까지 골라라.
-충분하면 빈 배열을 반환해라.
-JSON 배열로만 답해라. 예: ["src/models/user.py"] 또는 []
-"""
-
-
 def get_project_tree(root: str = ".", exclude_dirs: list[str] | None = None, max_files: int = 500) -> str:
     exclude_dirs = set(exclude_dirs or [])
     paths = []
@@ -199,43 +184,6 @@ def select_relevant_files(llm, task: str, root: str = ".", exclude_dirs: list[st
         if os.path.exists(os.path.join(root, f)) or allow_new:
             out.append(f)
     return out
-
-
-def confirm_and_expand_files(llm, task: str, root: str, selected: list[str], tree: str,
-                              guide: str = "", max_extra: int = 3) -> list[str]:
-    """1차로 고른 파일의 실제 내용을 보여주고, 부족하면 추가 파일을 더 고르게 한다.
-
-    저장소를 실제로 열어보며 탐색하는 도구 기반 에이전트를 흉내 내는 저비용 방법:
-    파일명만 보고 고른 1차 선택을 내용까지 보여준 뒤 한 번 더 검토시킨다.
-    실패하거나 추가 선택이 없으면 selected를 그대로 반환한다(안전한 폴백).
-    """
-    remaining = [p for p in tree.split("\n") if p and p not in selected]
-    if not remaining:
-        return selected
-
-    contents = read_files(root, selected)
-    contents_str = "\n\n".join(
-        f"### {f}\n```\n{c if c else '(새 파일 - 아직 내용 없음)'}\n```" for f, c in contents.items()
-    ) or "(선택된 파일 없음)"
-    remaining_tree = "\n".join(remaining[:500])
-
-    prompt = FILE_CONFIRM_PROMPT.format(
-        guide=project_guide.as_prelude(guide), task=task,
-        contents=contents_str, remaining_tree=remaining_tree,
-    )
-    try:
-        result = llm.generate(prompt, json_mode=True, num_predict=512)
-    except Exception:
-        return selected
-
-    if isinstance(result, dict):
-        result = result.get("files", [])
-    if not isinstance(result, list):
-        return selected
-
-    extra = [_resolve_path(root, tree, str(f)) for f in result][:max_extra]
-    extra = [f for f in extra if f not in selected and os.path.exists(os.path.join(root, f))]
-    return selected + extra
 
 
 def _resolve_path(root: str, tree: str, name: str) -> str:

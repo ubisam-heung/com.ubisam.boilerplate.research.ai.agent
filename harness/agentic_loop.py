@@ -1,11 +1,17 @@
 """도구 호출 기반 반복 루프(에이전틱 루프).
 
-기존 파이프라인(planner→executor 1회성)과 달리, 모델이 매 턴마다
-"다음에 뭘 할지"를 도구 호출 하나로 스스로 고르고, 그 결과를 다시
-보여준 뒤 또 고르게 하는 것을 모델이 done을 선언하거나 최대 스텝
-수에 닿을 때까지 반복한다. "기능 개발" 같은 다단계 작업에서
-1회성 파이프라인이 계획을 재검토하지 못하는 한계를 메운다.
+모델이 매 턴마다 "다음에 뭘 할지"를 도구 호출 하나로 스스로 고르고, 그
+결과를 다시 보여준 뒤 또 고르게 하는 것을 모델이 done을 선언하거나
+최대 스텝 수에 닿을 때까지 반복한다. local/external 구분 없이 모든
+작업이 이 루프 하나로 처리된다.
+
+권한 모드(mode)에 따라 write_file/run_command 실행 전 사용자 승인이
+붙는다:
+- manual:    write_file, run_command 둘 다 매번 승인
+- edit-only: write_file은 자동 적용, run_command만 승인 (기본값)
+- auto:      둘 다 자동 실행 (pre-bash/pre-file hook 차단은 항상 유효)
 """
+import difflib
 import json
 import os
 import re
@@ -18,6 +24,8 @@ from harness.executor import (
 MAX_STEPS_DEFAULT = 20
 _MAX_TOOL_OUTPUT_CHARS = 4000
 _MAX_READ_CHARS = 12000
+MODES = ("manual", "edit-only", "auto")
+DEFAULT_MODE = "edit-only"
 
 SYSTEM_PROMPT = """당신은 코딩 에이전트다. 아래 도구를 매 턴 하나씩 호출해서
 작업을 완료해라. 파일 내용을 추측하지 말고, 필요하면 반드시 read_file이나
@@ -70,7 +78,8 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + f"\n... ({len(text) - limit}자 생략)"
 
 
-def _dispatch(action: dict, work_root: str, hook_roots, cfg: dict, log_fn) -> tuple[str, bool]:
+def _dispatch(action: dict, work_root: str, hook_roots, cfg: dict, log_fn,
+              mode: str = DEFAULT_MODE, confirm_fn=None) -> tuple[str, bool]:
     """도구 하나를 실행하고 (결과 텍스트, 종료여부)를 반환한다."""
     tool = action.get("tool")
 
@@ -169,6 +178,17 @@ def _dispatch(action: dict, work_root: str, hook_roots, cfg: dict, log_fn) -> tu
         else:
             return "오류: write_file은 content 또는 search/replace가 필요합니다.", False
 
+        diff = "".join(difflib.unified_diff(
+            current.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"a/{path}", tofile=f"b/{path}",
+        ))
+
+        if mode == "manual":
+            log_fn(diff if diff.strip() else f"(새 파일: {path})")
+            if confirm_fn is not None and not confirm_fn(f"{path}에 위 변경을 적용할까요?"):
+                return f"사용자가 {path} 변경 적용을 거부했습니다.", False
+
         backup_dir = cfg.get("harness", {}).get("backup_dir", ".agent_backup")
         backup_path = apply_change(work_root, path, new_content, backup_dir)
         log_fn(f"  [적용] {path} (백업: {backup_path})")
@@ -186,6 +206,9 @@ def _dispatch(action: dict, work_root: str, hook_roots, cfg: dict, log_fn) -> tu
             hooks.check_pre_bash(hook_roots, command)
         except hooks.HookBlocked as e:
             return f"차단됨: {e.message}", False
+        if mode in ("manual", "edit-only"):
+            if confirm_fn is not None and not confirm_fn(f"다음 명령을 실행할까요?\n$ {command}"):
+                return f"사용자가 명령 실행을 거부했습니다: {command}", False
         timeout = cfg.get("harness", {}).get("verify_timeout_sec", 120)
         results = verifier.run_verification([command], work_root, timeout)
         r = results[0]
@@ -201,11 +224,15 @@ def _dispatch(action: dict, work_root: str, hook_roots, cfg: dict, log_fn) -> tu
 
 
 def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
-             guide: str = "", max_steps: int | None = None) -> dict:
+             guide: str = "", max_steps: int | None = None,
+             mode: str = DEFAULT_MODE, confirm_fn=None) -> dict:
     """에이전틱 루프를 실행한다.
 
     모델이 매 스텝 도구 호출 JSON을 하나 반환하면 실행하고 결과를 이력에
     쌓아 다음 프롬프트에 넘긴다. done 호출 또는 max_steps 도달 시 종료.
+
+    mode: "manual"(전부 승인) | "edit-only"(파일수정 자동, 명령만 승인)
+          | "auto"(전부 자동). confirm_fn: 승인 질문(question:str) -> bool.
     """
     max_steps = max_steps or cfg.get("harness", {}).get("agentic_max_steps", MAX_STEPS_DEFAULT)
     system = SYSTEM_PROMPT.format(
@@ -236,10 +263,10 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
             continue
 
         log_fn(f"[에이전틱] 스텝 {step}: {action.get('tool')} {action.get('path') or action.get('pattern') or action.get('command') or ''}")
-        result, finished = _dispatch(action, work_root, hook_roots, cfg, log_fn)
+        result, finished = _dispatch(action, work_root, hook_roots, cfg, log_fn, mode=mode, confirm_fn=confirm_fn)
         steps_taken = step
 
-        if action.get("tool") == "write_file" and "오류" not in result and "차단" not in result:
+        if action.get("tool") == "write_file" and "오류" not in result and "차단" not in result and "거부" not in result:
             path = action.get("path")
             if path and path not in files_touched:
                 files_touched.append(path)

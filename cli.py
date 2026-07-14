@@ -34,7 +34,7 @@ if HAS_READLINE:
         pass
 
 import yaml
-from harness import metrics
+from harness import metrics, agentic_loop
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -51,8 +51,11 @@ VERSION = "1.0.0"
 MODELS = ("codex", "claude", "local", "openrouter")
 _MODEL_ALIASES = {"claude_code": "claude", "claudecode": "claude"}
 
+# 권한 모드: manual(전부 승인) / edit-only(파일수정 자동, 명령만 승인) / auto(전부 자동)
+MODES = agentic_loop.MODES
+
 # 슬래시 없이도 인식할 명령어. (예: "exit" == "/exit")
-BARE_COMMANDS = {"help", "model", "status", "config", "history", "clear", "metrics", "save", "exit", "quit", "q"}
+BARE_COMMANDS = {"help", "model", "mode", "status", "config", "history", "clear", "metrics", "save", "exit", "quit", "q"}
 
 
 # ANSI 이스케이프(컬러/커서 이동 등) 제거용 — 캡처한 출력을 가볍게 저장하기 위해 사용.
@@ -222,6 +225,7 @@ _HELP = """\
 
   [cyan]/help[/cyan]            이 도움말
   [cyan]/model[/cyan]           실행 모델 선택 (codex·claude·local·openrouter)
+  [cyan]/mode[/cyan]            권한 모드 선택 (manual·edit-only·auto)
   [cyan]/status[/cyan]          연결 상태 확인
   [cyan]/config[/cyan]          현재 설정 보기
   [cyan]/metrics[/cyan]         작업 지표 요약 (로컬처리율·복구율 등)
@@ -407,13 +411,16 @@ def run_interactive(project_dir: str = "."):
     else:
         console.print()
 
-    console.print("  [dim]/help 명령어 목록  ·  /model 모델 선택  ·  /save 저장  ·  /exit 종료[/dim]\n")
+    console.print("  [dim]/help 명령어 목록  ·  /model 모델 선택  ·  /mode 권한 모드  ·  /save 저장  ·  /exit 종료[/dim]\n")
 
     sessions_dir = os.path.join(project_dir, config.get("sessions", {}).get("dir", "sessions"))
     recorder = SessionRecorder(sessions_dir)
 
     history: List[str] = []
-    ui = {"model": _default_model(config)}
+    default_mode = config.get("harness", {}).get("default_mode", agentic_loop.DEFAULT_MODE)
+    if default_mode not in MODES:
+        default_mode = agentic_loop.DEFAULT_MODE
+    ui = {"model": _default_model(config), "mode": default_mode}
     pending_preamble = {"text": ""}
 
     crashed = SessionRecorder.find_crashed(sessions_dir)
@@ -474,12 +481,12 @@ def run_interactive(project_dir: str = "."):
             def _rec_log(msg: str, _r=recorder):
                 _r.append(msg)
                 _rich_log(msg)
-            _run_task(task, project_dir, ui["model"], log_fn=_rec_log)
+            _run_task(task, project_dir, ui["model"], log_fn=_rec_log, mode=ui["mode"])
             recorder.end_turn()
             _autosave(recorder)
         else:
             # 내부 호환용 auto: run_agent가 local_llm -> OpenRouter -> external_tools 순서로 라우팅한다.
-            _run_auto_mode(task, project_dir, config, recorder, pending_preamble)
+            _run_auto_mode(task, project_dir, config, recorder, pending_preamble, mode=ui["mode"])
 
     # 세션 종료 시 자동 저장
     saved = recorder.save(status="ended")
@@ -533,6 +540,28 @@ def _handle_command(
                 ui["model"] = choice
                 console.print(
                     f"  [green]✓[/green]  실행 모델을 [cyan]{choice}[/cyan] 로 설정했습니다."
+                )
+        return
+
+    if cmd == "/mode":
+        parts = raw.split()
+        if len(parts) == 1:
+            console.print(f"  현재 모드: [cyan]{ui['mode']}[/cyan]")
+            console.print(
+                f"  [dim]사용 가능: {', '.join(MODES)}"
+                f"  (예: /mode auto)[/dim]"
+            )
+        else:
+            choice = parts[1].lower()
+            if choice not in MODES:
+                console.print(
+                    f"  [yellow]알 수 없는 모드:[/yellow] {escape(parts[1])}"
+                    f"  [dim]— {', '.join(MODES)}[/dim]"
+                )
+            else:
+                ui["mode"] = choice
+                console.print(
+                    f"  [green]✓[/green]  권한 모드를 [cyan]{choice}[/cyan] 로 설정했습니다."
                 )
         return
 
@@ -679,7 +708,8 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
     return tail
 
 
-def _run_task(task: str, project_dir: str, model: str = "auto", log_fn=None):
+def _run_task(task: str, project_dir: str, model: str = "auto", log_fn=None,
+              mode: str = agentic_loop.DEFAULT_MODE):
     label = task if len(task) <= 55 else task[:52] + "..."
     console.print()
     console.print(Rule(f"[dim]{escape(label)}[/dim]", style="dim blue"))
@@ -689,7 +719,7 @@ def _run_task(task: str, project_dir: str, model: str = "auto", log_fn=None):
     start = time.monotonic()
     try:
         from agent import run_agent
-        run_agent(task, root=project_dir, log_fn=effective_log, force=force, confirm_fn=_rich_confirm)
+        run_agent(task, root=project_dir, log_fn=effective_log, force=force, confirm_fn=_rich_confirm, mode=mode)
     except KeyboardInterrupt:
         console.print("\n  [yellow]⚠[/yellow]  작업이 중단되었습니다.")
     except Exception as exc:
@@ -724,7 +754,7 @@ def _is_obviously_coding(task: str) -> bool:
 
 
 def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionRecorder,
-                    pending_preamble: Optional[dict] = None):
+                    pending_preamble: Optional[dict] = None, mode: str = agentic_loop.DEFAULT_MODE):
     """auto 모드: local_llm이 먼저 받고, 필요할 때 OpenRouter/외부 도구 순으로 폴백한다."""
     if pending_preamble and pending_preamble.get("text"):
         recorder.append("[안내] auto 모드에서는 이전 외부 대화 요약을 직접 주입하지 않습니다.")
@@ -734,7 +764,7 @@ def _run_auto_mode(task: str, project_dir: str, config: dict, recorder: SessionR
         _r.append(msg)
         _rich_log(msg)
 
-    _run_task(task, project_dir, "auto", log_fn=_rec_log)
+    _run_task(task, project_dir, "auto", log_fn=_rec_log, mode=mode)
     recorder.end_turn()
     _autosave(recorder)
 
@@ -751,9 +781,13 @@ def run_single(task: str, project_dir: str = "."):
         )
     )
     console.print()
+    config = _load_config(project_dir)
+    mode = config.get("harness", {}).get("default_mode", agentic_loop.DEFAULT_MODE)
+    if mode not in MODES:
+        mode = agentic_loop.DEFAULT_MODE
     try:
         from agent import run_agent
-        run_agent(task, root=project_dir, log_fn=_rich_log, confirm_fn=_rich_confirm)
+        run_agent(task, root=project_dir, log_fn=_rich_log, confirm_fn=_rich_confirm, mode=mode)
     except KeyboardInterrupt:
         console.print("\n  [yellow]⚠[/yellow]  작업이 중단되었습니다.")
         sys.exit(1)

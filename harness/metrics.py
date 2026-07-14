@@ -2,8 +2,7 @@
 
 매 작업 실행마다 logs/metrics.jsonl 한 줄을 남기고, summarize()로 발표용 수치를 만든다.
 - 로컬 처리 비율(= 사내 코드 외부 미전송 비율)
-- 평균 처리시간
-- 검증 통과율 / 자동복구 성공률
+- 평균 처리시간 / 평균 에이전틱 스텝 수
 - 로컬 처리로 외부에 보내지 않은 추정 토큰 → 비용 절감 추정
 """
 import json
@@ -51,20 +50,20 @@ def _ratio(num: int, den: int):
 
 
 # 백엔드 표시 순서·라벨. tool 필드는 표기가 제각각이라(claude/claude_code/codex) 정규화한다.
-BACKENDS = ("local", "claude_code", "codex")
-BACKEND_LABELS = {"local": "로컬 LLM", "claude_code": "Claude Code", "codex": "Codex"}
+BACKENDS = ("local", "openrouter", "claude_code", "codex")
+BACKEND_LABELS = {"local": "로컬 LLM", "openrouter": "OpenRouter", "claude_code": "Claude Code", "codex": "Codex"}
 _TOOL_ALIASES = {"claude": "claude_code", "claudecode": "claude_code"}
 
 
 def backend_of(record: dict) -> str:
     """작업 1건이 어떤 백엔드에서 처리됐는지 정규화해 반환한다.
 
-    decision이 local이면 'local', external이면 tool 필드(claude/claude_code/codex)를
-    표준 키로 정규화한다. 분류 불가(n/a 등)는 None.
+    decision이 local/openrouter면 그대로, external이면 tool 필드
+    (claude/claude_code/codex)를 표준 키로 정규화한다. 분류 불가(n/a 등)는 None.
     """
     decision = record.get("decision")
-    if decision == "local":
-        return "local"
+    if decision in ("local", "openrouter"):
+        return decision
     if decision == "external":
         tool = (record.get("tool") or "").strip().lower()
         return _TOOL_ALIASES.get(tool, tool) or "claude_code"
@@ -108,14 +107,14 @@ def summarize(records: list, price_per_mtok: float = DEFAULT_PRICE_PER_MTOK) -> 
             "ratio": _ratio(agg["count"], routed_total),
         }
 
+    # "로컬 처리 비율"은 사내 코드를 외부로 보내지 않은 비율 — openrouter는 외부 API로
+    # 코드가 나가므로 local이 아니라 external 쪽으로 집계한다.
     local = by_backend.get("local", {"count": 0, "tokens": 0})
     external_count = routed_total - local["count"]
     local_tokens = local["tokens"]
 
-    verify_runs = [r for r in records if r.get("verify_ran")]
-    verify_pass = [r for r in verify_runs if r.get("all_passed_final")]
-    rec_runs = [r for r in records if int(r.get("recovery_attempts_total") or 0) > 0]
-    rec_success = [r for r in rec_runs if r.get("all_passed_final")]
+    steps = [int(r["steps_taken"]) for r in records
+              if isinstance(r.get("steps_taken"), (int, float))]
 
     return {
         "total": total,
@@ -126,12 +125,9 @@ def summarize(records: list, price_per_mtok: float = DEFAULT_PRICE_PER_MTOK) -> 
         # 로컬 비율은 라우팅된 작업(local+external) 기준 — no_files 등 비라우팅 건은 제외
         "local_ratio": _ratio(local["count"], routed_total),
         "avg_duration_sec": (sum(durations) / len(durations)) if durations else None,
+        "avg_steps_taken": (sum(steps) / len(steps)) if steps else None,
         "local_tokens_kept_inhouse": local_tokens,
         "cost_avoided_usd": local_tokens / 1_000_000 * price_per_mtok,
-        "verify_runs": len(verify_runs),
-        "verify_pass_rate": _ratio(len(verify_pass), len(verify_runs)),
-        "recovery_runs": len(rec_runs),
-        "recovery_success_rate": _ratio(len(rec_success), len(rec_runs)),
         "price_per_mtok": price_per_mtok,
     }
 
@@ -173,10 +169,7 @@ def format_report(summary: dict) -> str:
         f"(로컬 {s['local']} / 외부 {s['external']})",
         f"  └ = 사내 코드 외부 미전송 비율",
         f"  평균 처리시간           {_num(s['avg_duration_sec'], '초')}",
-        f"  검증 통과율             {_pct(s['verify_pass_rate'])}  "
-        f"(검증 실행 {s['verify_runs']}건)",
-        f"  자동복구 성공률         {_pct(s['recovery_success_rate'])}  "
-        f"(복구 시도 {s['recovery_runs']}건)",
+        f"  평균 에이전틱 스텝 수    {_num(s['avg_steps_taken'])}",
         f"  외부 미전송 토큰(추정)  {s['local_tokens_kept_inhouse']:,} tok",
         f"  추정 비용 절감          ${s['cost_avoided_usd']:.2f}  "
         f"(@${s['price_per_mtok']}/1M tok)",

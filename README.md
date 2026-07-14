@@ -24,6 +24,7 @@
 - [5. 실행](#5-실행)
 - [6. 실행 모델 선택 (/model)](#6-실행-모델-선택-model)
 - [6-1. 작업 지표 (metrics)](#6-1-작업-지표-metrics)
+- [6-2. 권한 모드 (/mode)](#6-2-권한-모드-mode)
 - [7. 설정 (config.yaml)](#7-설정-configyaml)
 - [8. 가드레일 / 안전장치](#8-가드레일--안전장치)
 - [9. 디렉토리 구조](#9-디렉토리-구조)
@@ -35,29 +36,30 @@
 
 ## 무엇인가 / 무엇이 아닌가
 
-- **이다**: ollama로 직접 도는 **독립 실행형 에이전트**. 관련 파일 탐색 → 라우팅 판단 →
-  (로컬/OpenRouter) 계획·변경·검증·자동 복구 / (외부) Claude Code·Codex 위임까지 자체 파이프라인으로 수행합니다.
-- **아니다**: 단순 프롬프트 래퍼가 아닙니다. 검증(`verify_commands`)과 백업·자동 복구, 가드레일 hook을 포함합니다.
+- **이다**: ollama로 직접 도는 **독립 실행형 에이전트**. 모델이 매 턴 스스로 도구를
+  호출하며 탐색·수정·검증을 반복하는 단일 **에이전틱 루프**로 모든 작업을 처리하고,
+  안 되면 Claude Code·Codex로 위임합니다.
+- **아니다**: 단순 프롬프트 래퍼가 아닙니다. 파일 수정 전 diff 프리뷰·승인, 백업,
+  가드레일 hook을 포함합니다.
 
 ### 동작 흐름
 
 ```
 입력
- └─> 관련 파일 탐색 (grep 사전 필터 + 로컬 LLM 파일명 선택 → 내용 확인 후 추가 선택)
-      └─> 라우팅 판단 (local | external)
-           ├─ [local]     계획 수립(1회) → SEARCH/REPLACE 생성/적용 → 검증 → 실패 시 자동 복구(최대 N회, 이전 시도 이력 누적)
-           └─ [external]  OpenRouter 에이전틱 루프 우선 시도 → 실패 시 Claude Code / Codex CLI 호출
+ └─> 에이전틱 루프 (harness/agentic_loop.py) — local_llm 또는 OpenRouter
+      매 턴 list_dir / grep / read_file / write_file / run_command / done 중
+      하나를 모델이 스스로 골라 실행하고, 결과를 본 뒤 다음 행동을 다시 고른다.
+      done을 선언하거나 harness.agentic_max_steps(기본 20)에 닿으면 종료.
+      └─ 실패 시 Claude Code / Codex CLI로 위임 (비대화형 1회성 -p/exec)
 ```
 
-**local vs external의 차이**: `local`은 계획을 한 번 세우고 그대로 밀어붙이는
-1회성 파이프라인이라 빠르지만, 여러 파일에 걸치거나 진행하며 계획을 수정해야
-하는 작업엔 약합니다. `external`(`routing.force_external_keywords`에 걸리거나
-라우팅 LLM이 복잡하다고 판단한 작업)은 [harness/agentic_loop.py](harness/agentic_loop.py)가
-처리합니다 — 모델이 매 턴 `list_dir`/`grep`/`read_file`/`write_file`/`run_command`/`done`
-중 하나를 스스로 호출하고 그 결과를 본 뒤 다음 행동을 다시 고르는 것을,
-`done`을 선언하거나 `harness.agentic_max_steps`(기본 20)에 닿을 때까지 반복합니다.
-"기능 개발해줘"처럼 사전에 계획을 다 세우기 어려운 다단계 작업은 이 경로로
-보내는 것을 권장합니다(`force_external_keywords`에 "기능 개발" 등을 추가해 두었습니다).
+local_llm과 OpenRouter는 "1회성 계획 vs 에이전틱 루프"로 나뉘지 않습니다 — 어떤
+백엔드 LLM을 쓰느냐만 다르고, 실행 방식은 항상 이 루프 하나입니다. 여러 파일에
+걸치거나 진행하며 계획을 수정해야 하는 작업도 모델이 매 스텝 재판단하므로 그대로
+처리됩니다.
+
+`write_file`/`run_command` 실행 전 승인 여부는 **권한 모드**(`/mode`)로 조절합니다.
+자세한 내용은 [6-2. 권한 모드 (/mode)](#6-2-권한-모드-mode) 참고.
 
 단일 작업 실행은 자동 라우팅을 사용합니다. 대화형 모드에서는 `/model` 명령으로
 `local`·`openrouter`·`claude`·`codex` 중 하나를 선택합니다.
@@ -339,9 +341,10 @@ agent (local) ❯ Calculator/main.py가 무슨 코드인지 설명해줘
 |---|---|
 | `/help` | 도움말 |
 | `/model` | 실행 모델 선택 (아래 참고) |
+| `/mode` | 권한 모드 선택 (아래 [6-2](#6-2-권한-모드-mode) 참고) |
 | `/status` | Ollama·모델 연결 상태 확인 |
 | `/config` | 현재 `config.yaml` 설정 보기 |
-| `/metrics` | 작업 지표 요약 (로컬처리율·검증/복구율·비용절감) |
+| `/metrics` | 작업 지표 요약 (로컬처리율·평균 스텝 수·비용절감) |
 | `/history` | 최근 작업 목록 |
 | `/save [태그]` | 현재 세션 JSON 저장 |
 | `/clear` | 화면 지우기 |
@@ -415,8 +418,7 @@ AI Agent 작업 지표 (기대효과 정량화)
   총 작업 건수            7건
   로컬 처리 비율          67%  (로컬 4 / 외부 2)   ← 사내 코드 외부 미전송 비율
   평균 처리시간           30.8초
-  검증 통과율             67%
-  자동복구 성공률         50%
+  평균 에이전틱 스텝 수    4.2
   외부 미전송 토큰(추정)  5,900 tok
   추정 비용 절감          $0.02  (@$3.0/1M tok)
 ```
@@ -424,6 +426,33 @@ AI Agent 작업 지표 (기대효과 정량화)
 - **로컬 처리 비율** = 라우팅된 작업 중 로컬에서 처리된 비율(= 사내 코드를 외부로 보내지 않은 비율).
 - 외부 LLM 단가는 `harness/metrics.py`의 `DEFAULT_PRICE_PER_MTOK`로 조정합니다.
 - 보안형 하이브리드 Agent의 **정량 효과(보안·비용)** 를 그대로 보여주는 발표용 지표입니다.
+
+---
+
+## 6-2. 권한 모드 (/mode)
+
+에이전틱 루프가 `write_file`(파일 수정)과 `run_command`(셸 명령 실행)를 실행하기
+전에 사용자 승인을 받을지 여부를 정합니다. Claude Code의 권한 모드(승인/자동수락/plan)와
+같은 개념입니다.
+
+```
+agent (local) ❯ /mode
+  현재 모드: edit-only
+  사용 가능: manual, edit-only, auto  (예: /mode auto)
+agent (local) ❯ /mode manual
+  ✓  권한 모드를 manual 로 설정했습니다.
+```
+
+| 값 | write_file | run_command |
+|---|---|---|
+| `manual` | 매번 diff를 보여주고 승인 필요 | 매번 승인 필요 |
+| `edit-only` (기본값) | 자동 적용 (diff는 로그로 표시) | 매번 승인 필요 |
+| `auto` | 자동 적용 | 자동 실행 |
+
+- 어느 모드든 `pre-bash`/`pre-file` 가드레일 hook의 차단은 항상 유효합니다 — 승인
+  절차를 건너뛰어도 위험 명령·민감 파일 접근은 막힙니다.
+- 기본값은 `config.yaml`의 `harness.default_mode`로 바꿀 수 있습니다.
+- 단일 작업 모드(`./agent "..."`)에서도 `harness.default_mode`를 따릅니다.
 
 ---
 
@@ -441,17 +470,14 @@ AI Agent 작업 지표 (기대효과 정량화)
 | `openrouter.api_key` | OpenRouter API 키 (비워두면 `OPENROUTER_API_KEY` 환경변수 사용) |
 | `openrouter.model` | 사용할 모델 ID (예: `anthropic/claude-3.5-sonnet`) |
 | `openrouter.base_url` | OpenRouter API 주소 (기본 `https://openrouter.ai/api/v1`) |
-| `routing.max_local_files` | 이 파일 수를 넘으면 외부로 라우팅 |
-| `routing.max_local_tokens` | 이 토큰 수를 넘으면 외부로 라우팅 |
-| `routing.force_external_keywords` | 포함 시 무조건 external(에이전틱 루프)로 보내는 키워드 (예: "전체 리팩토링", "기능 개발") |
-| `external_tools.default` | OpenRouter 실패 후 사용할 기본 외부 도구 (`claude_code` \| `codex`) |
+| `external_tools.default` | 에이전틱 루프 실패 후 사용할 기본 외부 도구 (`claude_code` \| `codex`) |
 | `external_tools.claude_code.enabled` | claude_code 외부 도구 사용 여부 (기본 `true`) |
 | `external_tools.claude_code.command` | Claude Code 실행 명령 (기본 `["claude", "-p"]`) |
 | `external_tools.codex.enabled` | codex 외부 도구 사용 여부 (기본 `true`) |
 | `external_tools.codex.command` | Codex 실행 명령 (기본 `["codex", "exec"]`) |
-| `harness.max_recovery_retries` | 검증 실패 시 자동 복구 재시도 횟수 (기본 5) |
-| `harness.agentic_max_steps` | 에이전틱 루프(external)가 `done` 없이 반복할 수 있는 최대 스텝 수 (기본 20) |
-| `harness.verify_timeout_sec` | 검증 명령 타임아웃 초 (기본 120) |
+| `harness.default_mode` | 권한 모드 기본값: `manual` \| `edit-only` \| `auto` (기본 `edit-only`, [6-2](#6-2-권한-모드-mode) 참고) |
+| `harness.agentic_max_steps` | 에이전틱 루프가 `done` 없이 반복할 수 있는 최대 스텝 수 (기본 20) |
+| `harness.verify_timeout_sec` | 검증 명령(run_command) 타임아웃 초 (기본 120) |
 | `harness.backup_dir` | 변경 전 백업 디렉토리 (기본 `.agent_backup`) |
 | `harness.exclude_dirs` | 파일 탐색에서 제외할 디렉토리 |
 | `sessions.dir` | 대화 세션 JSON 저장 디렉토리. 진행 중에도 실시간에 가깝게 갱신 |
@@ -460,13 +486,12 @@ AI Agent 작업 지표 (기대효과 정량화)
 
 ### 백엔드 우선순위 (local_llm / openrouter / external_tools)
 
-단일 작업 모드와 내부 자동 라우팅은 다음 순서로 처리됩니다:
+단일 작업 모드와 내부 자동 실행은 다음 순서로 처리됩니다:
 
-1. `local_llm.enabled: true` → Ollama가 먼저 파일 선택·분석·라우팅을 수행
-2. 라우팅 결과가 external이거나 로컬 계획/변경이 실패했고 `openrouter.enabled: true` → OpenRouter가 먼저 작업 시도
-3. OpenRouter가 비활성화되어 있거나 연결/API/계획/변경 실패 → 외부 도구(`claude_code`/`codex`)로 폴백
-4. local_llm과 openrouter가 모두 꺼져 있으면 바로 외부 도구로 위임
-5. 외부 도구까지 전부 `enabled: false`면 에러 메시지를 출력하고 중단합니다
+1. `local_llm.enabled: true` → Ollama가 에이전틱 루프를 실행 (없으면 openrouter로)
+2. `openrouter.enabled: true` → OpenRouter가 에이전틱 루프를 실행
+3. 에이전틱 루프가 완료하지 못했거나(`success: false`) local_llm/openrouter가 모두 꺼져 있으면 → 외부 도구(`claude_code`/`codex`)로 폴백
+4. 외부 도구까지 전부 `enabled: false`면 에러 메시지를 출력하고 중단합니다
 
 `/model local`은 Ollama를 강제하고, `/model openrouter`는 OpenRouter를 강제합니다.
 OpenRouter를 쓰려면 `openrouter.enabled: true`와 `api_key`(또는 `OPENROUTER_API_KEY`)를 설정하세요.
@@ -480,7 +505,8 @@ OpenRouter를 쓰려면 `openrouter.enabled: true`와 `api_key`(또는 `OPENROUT
 작업 전·중·후에 다음 보호 장치가 동작합니다. 행동 규칙 전문은 [AGENTS.md](AGENTS.md) 참고.
 
 - **변경 전 백업** — 모든 수정 전 원본을 `.agent_backup/`에 백업합니다.
-- **자동 복구** — 검증(`verify_commands`) 실패 시 최대 N회 자동 복구, 그래도 실패하면 백업 경로를 안내합니다.
+- **diff 프리뷰 + 승인** — 권한 모드(`/mode`)에 따라 파일 수정/명령 실행 전 diff·명령어를
+  보여주고 승인을 받습니다. 자세한 내용은 [6-2. 권한 모드](#6-2-권한-모드-mode) 참고.
 - **Hook 기반 차단** (`.agent-harness/hooks/`):
   - `pre-bash` — `rm -rf`, `git reset --hard` / `clean -f` / force push, `git config user.*` 변경,
     `sudo`·`shutdown`·`mkfs`·`dd` 등 시스템 변경 명령 차단
@@ -568,13 +594,13 @@ demo-agent-project/          ← 프레임워크 (바깥)
 ├── agent              # 실행 런처 (./agent)
 ├── agent.py           # 메인 진입점 (run_agent)
 ├── cli.py             # 대화형 TUI
-├── router.py          # local / openrouter / external 라우팅
-├── config.yaml        # 설정 한 곳 (harness.work_dir 포함)
+├── router.py          # 잡담 판별 · 외부 도구 선택
+├── config.yaml        # 설정 한 곳 (harness.work_dir, harness.default_mode 포함)
 ├── doctor.sh          # 진단 스크립트
 ├── AGENTS.md          # 에이전트 행동 규칙(가드레일)
 ├── requirements.txt
 ├── backends/          # LLM·외부 도구 어댑터 (local_llm / openrouter / claude_code_cli / codex_cli)
-├── harness/           # 실행 파이프라인 (context/planner/executor/verifier/recovery/hooks/agentic_loop)
+├── harness/           # 실행 파이프라인 (context/executor/verifier/hooks/agentic_loop)
 ├── src/               # 프레임워크 공용 유틸
 ├── memory/            # 에이전트 메모리
 ├── workspace/         # ★ 수정 대상 프로젝트 (안쪽) — 에이전트는 여기만 본다
@@ -596,7 +622,8 @@ demo-agent-project/          ← 프레임워크 (바깥)
 3. `./doctor.sh .` 전체 `✓` 확인
 4. 작은 작업으로 먼저 테스트 (예: 단일 함수 추가)
 5. `.agent_backup/`에 변경 전 파일이 백업되는지 확인
-6. 큰 작업("전체 리팩토링" 등)을 입력해 OpenRouter 또는 외부 도구로 라우팅되는지 확인
+6. `/mode manual`로 전환해 diff 프리뷰와 y/n 승인 프롬프트가 뜨는지 확인
+7. local_llm/openrouter가 실패하는 상황을 만들어 외부 도구(claude_code/codex)로 폴백되는지 확인
 
 ---
 
@@ -611,7 +638,7 @@ demo-agent-project/          ← 프레임워크 (바깥)
 | 모델이 너무 느림 / 메모리 부족 | `config.yaml`의 `local_llm.model`을 더 작은 모델로 변경 |
 | `python3: command not found` (WSL) | `sudo apt install -y python3 python3-venv python3-pip` |
 | 외부 CLI 옵션 오류 | `config.yaml`의 `external_tools.*.command` 수정 |
-| local/OpenRouter 응답이 중간에 끊기거나 JSON 파싱 실패 | `backends/local_llm.py`·`backends/openrouter.py`의 `generate()`는 `num_predict` 기본값이 512다. 파일 전체를 다시 쓰는 `executor.py`/`recovery.py`는 8192, 다중 변경 계획을 내는 `planner.py`와 설명 모드(`agent.py`의 `explain_task`)는 4096으로 명시 호출하도록 되어 있다. 같은 모델을 Claude Code 등 외부 도구로 직접 쓸 때보다 답변이 짧게 잘리는 느낌이면 이 상한이 원인일 수 있으니, 호출부에 맞는 `num_predict`가 넘어가는지 먼저 확인한다 |
+| local/OpenRouter 응답이 중간에 끊기거나 JSON 파싱 실패 | `backends/local_llm.py`·`backends/openrouter.py`의 `generate()`는 `num_predict` 기본값이 512다. 에이전틱 루프의 매 스텝 도구 호출(`harness/agentic_loop.py`)은 1024, 설명 모드(`agent.py`의 `explain_task`)는 4096으로 명시 호출하도록 되어 있다. 같은 모델을 Claude Code 등 외부 도구로 직접 쓸 때보다 답변이 짧게 잘리는 느낌이면 이 상한이 원인일 수 있으니, 호출부에 맞는 `num_predict`가 넘어가는지 먼저 확인한다 |
 
 ---
 
