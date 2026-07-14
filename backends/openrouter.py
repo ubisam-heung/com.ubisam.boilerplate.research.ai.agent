@@ -6,6 +6,8 @@ import json
 import os
 import requests
 
+from backends.json_repair import try_repair_truncated_json
+
 
 class OpenRouterLLM:
     def __init__(self, model: str, api_key: str = "",
@@ -75,6 +77,9 @@ class OpenRouterLLM:
         try:
             return json.loads(text)
         except json.JSONDecodeError as e:
+            repaired = try_repair_truncated_json(text)
+            if repaired is not None:
+                return repaired
             raise ValueError(f"OpenRouter가 유효한 JSON을 반환하지 않았습니다: {text[:300]}") from e
 
     def health_check(self) -> bool:

@@ -9,16 +9,39 @@ PLAN_PROMPT = """{guide}작업: {task}
 {file_contents}
 
 이 작업을 수행할 계획을 세워라.
-각 변경 항목마다 file, action(modify|create), description을 명시해라.
-verify_commands에는 변경 후 검증할 셸 명령어를 넣어라 (예: pytest, npm test, python -m pyflakes 등).
-프로젝트에 적합한 검증 명령이 불확실하면 빈 배열로 둬라.
+
+작업이 파일 수정을 요구하면: 각 변경 항목마다 file, action(modify|create), description을 명시해라.
+작업이 빌드/테스트/실행 등 셸 명령 실행만으로 끝나고 파일 수정이 필요 없다면:
+changes를 빈 배열로 두고, verify_commands에 실행할 명령을 반드시 채워라
+(예: "dotnet build UbiSam.Sources.Revision.sln", "pytest tests/ -q", "npm test").
+changes와 verify_commands가 둘 다 비면 안 된다 — 최소 하나는 채워야 한다.
+
+verify_commands의 각 항목은 문자열이거나 {{"cmd": "...", "expect_failure": true}} 객체다.
+보통은 명령이 exit 0(성공)이어야 "통과"다 — 이때는 문자열만 써라.
+단, "이 코드/텍스트가 없어야 한다", "아직 미구현이어야 한다"처럼 검색이 매칭되지
+않는 것 자체가 정답인 검증(예: grep으로 특정 필드가 없는지 확인)은 grep이 매칭 없을 때
+exit 1을 반환하는 게 정상이므로, 그 명령에는 반드시 "expect_failure": true를 붙여라.
+안 붙이면 정상적으로 미구현임을 확인한 것도 "검증 실패"로 잘못 보고된다.
+
+grep으로 만드는 검증 명령은 반드시 위 "관련 파일 내용"에 실제로 보이는 코드를
+근거로만 만들어라. 파일 내용에 없는 변수명/패턴을 추측해서 넣지 마라 — 실제로는
+있는데 이름을 잘못 짚으면 정상 구현도 "실패"로 오판된다.
+`grep -A n ... | grep -c ...`처럼 파이프로 조합한 grep은 특히 신뢰도가 낮다
+(첫 grep이 원하는 줄을 못 걸치면 두 번째 grep은 자동으로 매칭 0이 되는데, 이게
+"lock이 없다"는 뜻인지 "애초에 첫 grep 범위 설정이 틀렸다"는 뜻인지 구분이
+안 된다). 이런 명령은 되도록 피하고, 대신 파일 내용에서 이미 확인한 사실을
+"grep -n"으로 그 줄 자체를 직접 짚는 단순한 명령으로 바꿔라. 정말 파이프가
+필요하면 결과가 불확실할 수 있다는 뜻이니 expect_failure를 신중히 판단해라.
 
 JSON 형식 (이 형식 그대로, 다른 텍스트 없이):
 {{
   "changes": [
     {{"file": "path/to/file.py", "action": "modify", "description": "구체적인 변경 내용"}}
   ],
-  "verify_commands": ["pytest tests/ -q"]
+  "verify_commands": [
+    "pytest tests/ -q",
+    {{"cmd": "grep -n \\"Required\\" MessageItemDefinition.cs", "expect_failure": true}}
+  ]
 }}
 """
 
@@ -30,7 +53,10 @@ def make_plan(llm, task: str, file_contents: dict[str, str], guide: str = "") ->
     ) or "(관련 파일 없음)"
 
     prompt = PLAN_PROMPT.format(guide=project_guide.as_prelude(guide), task=task, file_contents=contents_str)
-    plan = llm.generate(prompt, json_mode=True, num_predict=4096)
+    # verify_commands가 {"cmd": ..., "expect_failure": true} 객체를 포함할 수 있게
+    # 되면서 계획 JSON이 길어졌다. 4096으로는 grep 명령이 여러 개면 중간에 잘려
+    # JSON 파싱이 깨지는 사례가 있어 8192로 올렸다.
+    plan = llm.generate(prompt, json_mode=True, num_predict=8192)
 
     if not isinstance(plan, dict) or "changes" not in plan:
         raise ValueError(f"계획 생성 실패: 잘못된 형식 -> {plan}")

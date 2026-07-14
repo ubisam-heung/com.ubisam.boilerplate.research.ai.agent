@@ -18,11 +18,17 @@ routing:
   # 1차 규칙 기반 필터 임계값
   max_local_files: 5
   max_local_tokens: 32000
+  # 여기 걸리면 1회성 계획→변경 파이프라인 대신 에이전틱 루프(harness/agentic_loop.py)로
+  # 처리한다. 여러 파일에 걸치거나 사전에 계획을 다 세우기 어려운 작업을 겨냥한 것.
   force_external_keywords:
     - "전체 리팩토링"
     - "아키텍처"
     - "마이그레이션"
     - "전체 프로젝트"
+    - "기능 개발"
+    - "기능을 개발"
+    - "기능 추가"
+    - "새 기능"
 
 external_tools:
   default: claude_code   # local 판단 실패 시 기본 사용 도구: claude_code | codex
@@ -41,7 +47,10 @@ harness:
   # 수정 대상 프로젝트 폴더. 프레임워크 파일(agent.py 등)과 분리하기 위해
   # 이 하위 폴더 안의 파일만 탐색/수정한다. 프레임워크 루트 전체를 대상으로 하려면 "."
   work_dir: "workspace"
-  max_recovery_retries: 3
+  max_recovery_retries: 5
+  # 에이전틱 루프(복잡한/다단계 작업)가 done을 선언하지 않고 반복할 수 있는 최대 스텝 수.
+  # 스텝마다 도구 호출 1번(read_file/grep/write_file/run_command 등) + LLM 호출 1번.
+  agentic_max_steps: 20
   verify_timeout_sec: 120
   backup_dir: ".agent_backup"
   exclude_dirs:
@@ -51,6 +60,12 @@ harness:
     - __pycache__
     - venv
     - .venv
+    # .NET 프로젝트를 다룰 때 필요. 없으면 "License" 같은 흔한 단어 검색 시
+    # NuGet 패키지 고지문/빌드 산출물이 실제 소스코드보다 우선 매칭될 수 있다.
+    - packages
+    - bin
+    - obj
+    - .vs
 
 logging:
   log_dir: "logs"

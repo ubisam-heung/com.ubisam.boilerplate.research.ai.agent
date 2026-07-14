@@ -12,7 +12,7 @@ from backends.local_llm import LocalLLM
 from backends.openrouter import OpenRouterLLM
 from backends import claude_code_cli, codex_cli
 from router import Router, is_chatter, reply_chatter, pick_external_tool, tool_enabled
-from harness import context, planner, executor, verifier, recovery, hooks, metrics, project_guide
+from harness import context, planner, executor, verifier, recovery, hooks, metrics, project_guide, agentic_loop
 
 
 def _build_main_llm(cfg: dict):
@@ -119,6 +119,64 @@ def _delegate_external(tool: str, task: str, hook_roots, run_root: str, log_fn, 
     log_fn(applied["output"])
 
 
+def _looks_like_piped_grep(cmd: str) -> bool:
+    """grep을 파이프로 두 번 이상 조합한 명령인지 대략 판별한다.
+
+    'grep -A2 X file | grep -c Y'처럼 앞 grep의 컨텍스트 범위에 뒤 grep의
+    매칭 여부가 좌우되는 조합은, 실패가 "코드에 없다"가 아니라 "범위 설정이
+    틀렸다"는 뜻일 수 있어 결과 신뢰도가 낮다. 정밀 파싱이 아니라 사용자에게
+    주의를 환기하는 용도이므로 grep이 2회 이상 등장하면 충분하다고 본다.
+    """
+    return cmd.count("grep") >= 2 and "|" in cmd
+
+
+def _run_verify_only(verify_cmds: list, work_root: str, hook_roots, cfg: dict, log_fn, label: str) -> dict:
+    """파일 수정 없이 검증 명령만 실행한다 (예: 빌드/테스트만 돌려보는 요청).
+
+    복구 루프는 고칠 파일이 없으므로 적용하지 않는다. 명령 결과를 그대로 보고한다.
+    """
+    timeout = cfg["harness"]["verify_timeout_sec"]
+    normalized = [verifier.normalize_command(c) for c in verify_cmds]
+    log_fn(f"{label}[검증] 파일 수정 없이 다음 명령을 실행합니다: {[c for c, _ in normalized]}")
+
+    blocked = False
+    for cmd, _ in normalized:
+        try:
+            hooks.check_pre_bash(hook_roots, cmd)
+        except hooks.HookBlocked as e:
+            log_fn(f"{label}[차단됨] 검증 명령 차단: {e.message}")
+            blocked = True
+    if blocked:
+        return {"success": False, "reason": "blocked", "verify_ran": False, "all_passed_final": False,
+                "recovery_attempts_total": 0}
+
+    results = verifier.run_verification(verify_cmds, work_root, timeout)
+    for r in results:
+        mark = "OK" if r["success"] else "FAIL"
+        note = " (미매칭=정상)" if r.get("expect_failure") and r["success"] else ""
+        log_fn(f"  $ {r['cmd']} -> {mark}{note}")
+        if not r["success"]:
+            log_fn(f"    --- output ---\n{r['output'][:2000]}\n    --------------")
+            if not r.get("expect_failure") and _looks_like_piped_grep(r["cmd"]):
+                log_fn("    [참고] grep을 파이프로 조합한 명령입니다 — 매칭 0이 "
+                       "\"코드에 없다\"가 아니라 \"앞 단계 grep 범위가 원하는 줄을 "
+                       "못 걸쳤다\"는 뜻일 수 있습니다. 결과를 그대로 신뢰하기보다 "
+                       "해당 파일을 직접 열어 확인하는 걸 권장합니다.")
+
+    passed = verifier.all_passed(results)
+    log_fn(f"{label}[완료] 검증 {'통과' if passed else '실패'}")
+    return {
+        # success: 파이프라인이 정상적으로 명령을 실행하고 결과를 보고했는지.
+        # 빌드/테스트 자체가 실패해도(all_passed_final=False) 이건 유효한 결과이지
+        # 상위 호출자가 외부 도구로 폴백해야 할 "파이프라인 실패"가 아니다.
+        "success": True,
+        "reason": "verify_only_completed" if passed else "verify_only_failed",
+        "verify_ran": True,
+        "all_passed_final": passed,
+        "recovery_attempts_total": 0,
+    }
+
+
 def _run_change_pipeline(llm, task: str, files: list[str], file_contents: dict[str, str],
                          work_root: str, hook_roots, cfg: dict, log_fn,
                          guide: str = "", step_prefix: str = "") -> dict:
@@ -144,8 +202,11 @@ def _run_change_pipeline(llm, task: str, files: list[str], file_contents: dict[s
         return {"success": False, "reason": "plan_failed", "error": "invalid_changes_type"}
 
     if not changes:
-        log_fn(f"{label}[안내] 수행할 변경 사항이 없습니다.")
-        return {"success": False, "reason": "no_changes"}
+        verify_cmds = plan.get("verify_commands") or []
+        if not verify_cmds:
+            log_fn(f"{label}[안내] 수행할 변경 사항도, 실행할 검증 명령도 없습니다.")
+            return {"success": False, "reason": "no_changes"}
+        return _run_verify_only(verify_cmds, work_root, hook_roots, cfg, log_fn, label)
 
     plan["changes"], dropped = planner.validate_changes(changes, files)
     for raw, why in dropped:
@@ -174,7 +235,16 @@ def _run_change_pipeline(llm, task: str, files: list[str], file_contents: dict[s
         f = change["file"]
         current = file_contents.get(f, "")
         log_fn(f"\n{label}[변경] 변경 생성 중: {f}")
-        new_content, diff = executor.generate_change(llm, f, current, change["description"])
+        try:
+            new_content, diff = executor.generate_change(llm, f, current, change["description"])
+        except executor.BlockApplyError as e:
+            log_fn(f"{label}[재시도] SEARCH 블록이 파일과 일치하지 않아 다시 시도합니다: {e}")
+            try:
+                new_content, diff = executor.generate_change(llm, f, current, change["description"])
+            except executor.BlockApplyError as e2:
+                log_fn(f"{label}[실패] {f}: 변경 생성 실패(SEARCH 불일치 반복) - {e2}")
+                all_passed_final = False
+                continue
         log_fn(diff if diff.strip() else "(diff 없음 - 새 파일)")
 
         try:
@@ -203,7 +273,7 @@ def _run_change_pipeline(llm, task: str, files: list[str], file_contents: dict[s
 
         log_fn(f"{label}[검증] 실행 중...")
         blocked = False
-        for cmd in verify_cmds:
+        for cmd, _ in (verifier.normalize_command(c) for c in verify_cmds):
             try:
                 hooks.check_pre_bash(hook_roots, cmd)
             except hooks.HookBlocked as e:
@@ -213,26 +283,38 @@ def _run_change_pipeline(llm, task: str, files: list[str], file_contents: dict[s
             all_passed_final = False
             continue
 
+        def _log_results(results):
+            for r in results:
+                mark = "OK" if r["success"] else "FAIL"
+                note = " (미매칭=정상)" if r.get("expect_failure") and r["success"] else ""
+                log_fn(f"  $ {r['cmd']} -> {mark}{note}")
+                if not r["success"]:
+                    log_fn(f"    --- output ---\n{r['output'][:2000]}\n    --------------")
+                    if not r.get("expect_failure") and _looks_like_piped_grep(r["cmd"]):
+                        log_fn("    [참고] grep을 파이프로 조합한 명령입니다 — 매칭 0이 "
+                               "\"코드에 없다\"가 아니라 \"앞 단계 grep 범위가 원하는 줄을 "
+                               "못 걸쳤다\"는 뜻일 수 있습니다.")
+
         results = verifier.run_verification(verify_cmds, work_root, timeout)
         verify_ran = True
-        for r in results:
-            log_fn(f"  $ {r['cmd']} -> {'OK' if r['success'] else 'FAIL'}")
-            if not r["success"]:
-                log_fn(f"    --- output ---\n{r['output'][:2000]}\n    --------------")
+        _log_results(results)
 
         attempt = 0
+        recovery_history = []
         while not verifier.all_passed(results) and attempt < max_retries:
             attempt += 1
             failed = next(r for r in results if not r["success"])
             log_fn(f"{label}[복구] 검증 실패, 자동 복구 시도 {attempt}/{max_retries}")
             with open(f"{work_root}/{f}", "r", encoding="utf-8") as fp:
                 cur = fp.read()
-            recovery.recover_file(llm, work_root, f, cur, failed)
+            _, recovery_diff = recovery.recover_file(llm, work_root, f, cur, failed, history=recovery_history)
             results = verifier.run_verification(verify_cmds, work_root, timeout)
-            for r in results:
-                log_fn(f"  $ {r['cmd']} -> {'OK' if r['success'] else 'FAIL'}")
-                if not r["success"]:
-                    log_fn(f"    --- output ---\n{r['output'][:2000]}\n    --------------")
+            _log_results(results)
+            new_failed = next((r for r in results if not r["success"]), None)
+            recovery_history.append({
+                "diff": recovery_diff,
+                "error": new_failed["output"] if new_failed else "(검증 통과)",
+            })
 
         recovery_attempts_total += attempt
         if verifier.all_passed(results):
@@ -253,25 +335,30 @@ def _run_change_pipeline(llm, task: str, files: list[str], file_contents: dict[s
 def _delegate_openrouter(task: str, files: list[str], file_contents: dict[str, str],
                          work_root: str, hook_roots, cfg: dict, log_fn,
                          guide: str = "") -> dict:
-    """OpenRouter가 켜져 있으면 외부 CLI 대신 먼저 코딩 파이프라인을 시도한다."""
+    """OpenRouter가 켜져 있으면 외부 CLI 대신 먼저 에이전틱 루프로 시도한다.
+
+    router가 "external"(복잡한/다단계 작업)로 판단한 케이스가 여기로 온다.
+    1회성 계획→변경 파이프라인 대신, 모델이 스스로 도구를 반복 호출하며
+    탐색·수정·검증하는 agentic_loop를 쓴다 — 여러 파일에 걸친 기능 개발처럼
+    사전에 세운 계획 하나로는 부족한 작업에 대응하기 위함이다.
+    """
     llm = _build_openrouter_llm(cfg)
     if llm is None:
         return {"attempted": False, "success": False, "reason": "disabled"}
-    log_fn("[OpenRouter] 위임을 먼저 시도합니다.")
+    log_fn("[OpenRouter] 에이전틱 루프로 위임을 먼저 시도합니다.")
     if not llm.health_check():
         log_fn("[OpenRouter] 연결 실패 또는 API 키 없음. 외부 도구로 폴백합니다.")
         return {"attempted": True, "success": False, "reason": "health_check_failed"}
     try:
-        result = _run_change_pipeline(
-            llm, task, files, file_contents, work_root, hook_roots, cfg, log_fn,
-            guide=guide, step_prefix="[OpenRouter]",
+        result = agentic_loop.run_loop(
+            llm, task, work_root, hook_roots, cfg, log_fn, guide=guide,
         )
     except Exception as exc:
         log_fn(f"[OpenRouter] 실패: {exc}. 외부 도구로 폴백합니다.")
         return {"attempted": True, "success": False, "reason": "exception"}
     result["attempted"] = True
     if result.get("success"):
-        log_fn("[OpenRouter] 작업 완료")
+        log_fn(f"[OpenRouter] 작업 완료 ({result.get('steps_taken')}스텝, 수정 파일: {result.get('files_touched')})")
     else:
         log_fn(f"[OpenRouter] 완료하지 못함({result.get('reason')}). 외부 도구로 폴백합니다.")
     return result
@@ -330,11 +417,18 @@ def _looks_like_question(task: str) -> bool:
     return bool(t.endswith("?")) or bool(t.endswith("요?")) or bool(t.endswith("니?")) or bool(t.endswith("야?"))
 
 
-def _fallback_read_files(task: str, tree_paths: list) -> list:
+def _fallback_read_files(task: str, tree_paths: list, work_root: str | None = None,
+                          exclude_dirs: list | None = None) -> list:
     """파일 선택이 비었을 때의 대체 선택.
 
-    작업에 명시된 파일/폴더명 → 프로젝트 요약용 메타 파일 → 소스 코드 파일 순.
+    파일 내용 안 키워드 grep(work_root가 주어진 경우) → 작업에 명시된 파일/폴더명
+    → 프로젝트 요약용 메타 파일 → 소스 코드 파일 순.
     """
+    if work_root is not None:
+        grep_hits = context.grep_matching_files(task, work_root, exclude_dirs)
+        if grep_hits:
+            return grep_hits[:5]
+
     task_l = (task or "").lower()
     mentioned = [
         p for p in tree_paths
@@ -400,7 +494,7 @@ def explain_task(llm, task: str, work_root: str, exclude_dirs, log_fn, guide: st
     tree_paths = [p for p in context.get_project_tree(work_root, exclude_dirs).split("\n") if p]
     files = context.select_relevant_files(llm, task, work_root, exclude_dirs, guide=guide)
     if not files:
-        files = _fallback_read_files(task, tree_paths)
+        files = _fallback_read_files(task, tree_paths, work_root, exclude_dirs)
     if not files:
         log_fn("[안내] 읽을 코드 파일을 찾지 못했습니다. workspace/ 에 코드가 있는지 확인하세요.")
         return
@@ -561,13 +655,27 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
 
     # Step 1: 관련 파일 탐색 (work_root 기준)
     files = context.select_relevant_files(main_llm, task, work_root, exclude_dirs, guide=guide)
-    log_fn(f"[1/6] 선택된 파일: {files}")
+    if not files:
+        tree_paths = [p for p in context.get_project_tree(work_root, exclude_dirs).split("\n") if p]
+        files = _fallback_read_files(task, tree_paths, work_root, exclude_dirs)
+        if files:
+            log_fn(f"[1/6] (폴백) 선택된 파일: {files}")
+    else:
+        log_fn(f"[1/6] 선택된 파일: {files}")
 
     if not files:
         log_fn("[안내] 작업과 관련된 파일을 찾지 못했습니다.")
         log_fn("        설명/질문이 목적이면 질문 형태로 다시 입력하거나, /model claude 로 위임하세요.")
         _rec("n/a", "no_files")
         return
+
+    # Step 1-1: 1차 선택 파일의 실제 내용을 보여주고 부족하면 추가 선택 (도구 기반 탐색 흉내)
+    tree = context.get_project_tree(work_root, exclude_dirs)
+    expanded = context.confirm_and_expand_files(main_llm, task, work_root, files, tree, guide=guide)
+    if len(expanded) > len(files):
+        added = [f for f in expanded if f not in files]
+        log_fn(f"[1/6] 추가로 필요하다고 판단된 파일: {added}")
+        files = expanded
 
     file_contents = context.read_files(work_root, files)
     est_tokens = context.estimate_tokens(file_contents)
@@ -584,9 +692,8 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
         or_result = _delegate_openrouter(task, files, file_contents, work_root, hook_roots, cfg, log_fn, guide=guide)
         if or_result.get("success"):
             _rec("openrouter", "auto_openrouter", est_tokens=est_tokens, files=len(files),
-                 verify_ran=or_result.get("verify_ran", False),
-                 all_passed_final=or_result.get("all_passed_final", True),
-                 recovery_attempts_total=or_result.get("recovery_attempts_total", 0))
+                 steps_taken=or_result.get("steps_taken", 0),
+                 files_touched=or_result.get("files_touched", []))
             log_fn("\n[작업 종료]")
             return
 
@@ -629,9 +736,8 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
         if or_result.get("success"):
             _rec("openrouter", "local_fallback_openrouter", est_tokens=est_tokens, files=len(files),
                  local_reason=local_result.get("reason"),
-                 verify_ran=or_result.get("verify_ran", False),
-                 all_passed_final=or_result.get("all_passed_final", True),
-                 recovery_attempts_total=or_result.get("recovery_attempts_total", 0))
+                 steps_taken=or_result.get("steps_taken", 0),
+                 files_touched=or_result.get("files_touched", []))
             log_fn("\n[작업 종료]")
             return
 

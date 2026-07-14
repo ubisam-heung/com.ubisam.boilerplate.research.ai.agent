@@ -3,6 +3,8 @@ import json
 import re
 import requests
 
+from backends.json_repair import try_repair_truncated_json
+
 
 class LocalLLM:
     def __init__(self, model: str, base_url: str = "http://192.168.0.229:11345", temperature: float = 0.2):
@@ -64,6 +66,9 @@ class LocalLLM:
         try:
             return json.loads(text)
         except json.JSONDecodeError as e:
+            repaired = try_repair_truncated_json(text)
+            if repaired is not None:
+                return repaired
             raise ValueError(f"LLM이 유효한 JSON을 반환하지 않았습니다: {text[:300]}") from e
 
     def health_check(self) -> bool:

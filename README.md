@@ -43,11 +43,21 @@
 
 ```
 입력
- └─> 관련 파일 탐색 (로컬 LLM)
+ └─> 관련 파일 탐색 (grep 사전 필터 + 로컬 LLM 파일명 선택 → 내용 확인 후 추가 선택)
       └─> 라우팅 판단 (local | external)
-           ├─ [local]    계획 수립 → diff 생성/적용 → 검증 → 실패 시 자동 복구(최대 N회)
-           └─ [external]  OpenRouter 우선 시도 → 실패 시 Claude Code / Codex CLI 호출
+           ├─ [local]     계획 수립(1회) → SEARCH/REPLACE 생성/적용 → 검증 → 실패 시 자동 복구(최대 N회, 이전 시도 이력 누적)
+           └─ [external]  OpenRouter 에이전틱 루프 우선 시도 → 실패 시 Claude Code / Codex CLI 호출
 ```
+
+**local vs external의 차이**: `local`은 계획을 한 번 세우고 그대로 밀어붙이는
+1회성 파이프라인이라 빠르지만, 여러 파일에 걸치거나 진행하며 계획을 수정해야
+하는 작업엔 약합니다. `external`(`routing.force_external_keywords`에 걸리거나
+라우팅 LLM이 복잡하다고 판단한 작업)은 [harness/agentic_loop.py](harness/agentic_loop.py)가
+처리합니다 — 모델이 매 턴 `list_dir`/`grep`/`read_file`/`write_file`/`run_command`/`done`
+중 하나를 스스로 호출하고 그 결과를 본 뒤 다음 행동을 다시 고르는 것을,
+`done`을 선언하거나 `harness.agentic_max_steps`(기본 20)에 닿을 때까지 반복합니다.
+"기능 개발해줘"처럼 사전에 계획을 다 세우기 어려운 다단계 작업은 이 경로로
+보내는 것을 권장합니다(`force_external_keywords`에 "기능 개발" 등을 추가해 두었습니다).
 
 단일 작업 실행은 자동 라우팅을 사용합니다. 대화형 모드에서는 `/model` 명령으로
 `local`·`openrouter`·`claude`·`codex` 중 하나를 선택합니다.
@@ -433,13 +443,14 @@ AI Agent 작업 지표 (기대효과 정량화)
 | `openrouter.base_url` | OpenRouter API 주소 (기본 `https://openrouter.ai/api/v1`) |
 | `routing.max_local_files` | 이 파일 수를 넘으면 외부로 라우팅 |
 | `routing.max_local_tokens` | 이 토큰 수를 넘으면 외부로 라우팅 |
-| `routing.force_external_keywords` | 포함 시 무조건 외부로 보내는 키워드 (예: "전체 리팩토링") |
+| `routing.force_external_keywords` | 포함 시 무조건 external(에이전틱 루프)로 보내는 키워드 (예: "전체 리팩토링", "기능 개발") |
 | `external_tools.default` | OpenRouter 실패 후 사용할 기본 외부 도구 (`claude_code` \| `codex`) |
 | `external_tools.claude_code.enabled` | claude_code 외부 도구 사용 여부 (기본 `true`) |
 | `external_tools.claude_code.command` | Claude Code 실행 명령 (기본 `["claude", "-p"]`) |
 | `external_tools.codex.enabled` | codex 외부 도구 사용 여부 (기본 `true`) |
 | `external_tools.codex.command` | Codex 실행 명령 (기본 `["codex", "exec"]`) |
-| `harness.max_recovery_retries` | 검증 실패 시 자동 복구 재시도 횟수 (기본 3) |
+| `harness.max_recovery_retries` | 검증 실패 시 자동 복구 재시도 횟수 (기본 5) |
+| `harness.agentic_max_steps` | 에이전틱 루프(external)가 `done` 없이 반복할 수 있는 최대 스텝 수 (기본 20) |
 | `harness.verify_timeout_sec` | 검증 명령 타임아웃 초 (기본 120) |
 | `harness.backup_dir` | 변경 전 백업 디렉토리 (기본 `.agent_backup`) |
 | `harness.exclude_dirs` | 파일 탐색에서 제외할 디렉토리 |
@@ -563,7 +574,7 @@ demo-agent-project/          ← 프레임워크 (바깥)
 ├── AGENTS.md          # 에이전트 행동 규칙(가드레일)
 ├── requirements.txt
 ├── backends/          # LLM·외부 도구 어댑터 (local_llm / openrouter / claude_code_cli / codex_cli)
-├── harness/           # 실행 파이프라인 (context/planner/executor/verifier/recovery/hooks)
+├── harness/           # 실행 파이프라인 (context/planner/executor/verifier/recovery/hooks/agentic_loop)
 ├── src/               # 프레임워크 공용 유틸
 ├── memory/            # 에이전트 메모리
 ├── workspace/         # ★ 수정 대상 프로젝트 (안쪽) — 에이전트는 여기만 본다
