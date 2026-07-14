@@ -409,7 +409,7 @@ def explain_task(llm, task: str, work_root: str, exclude_dirs, log_fn, guide: st
     file_contents = context.read_files(work_root, files)
     contents_str = _format_explain_contents(file_contents)
     try:
-        answer = llm.generate(EXPLAIN_PROMPT.format(task=task, file_contents=contents_str))
+        answer = llm.generate(EXPLAIN_PROMPT.format(task=task, file_contents=contents_str), num_predict=4096)
     except Exception as exc:
         log_fn(f"[오류] 설명 생성 실패: {exc}")
         log_fn("        OpenRouter 모델명/API 키/컨텍스트 제한을 확인하세요.")

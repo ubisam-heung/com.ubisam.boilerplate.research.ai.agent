@@ -29,7 +29,7 @@ def recover_file(llm, root: str, filepath: str, current_content: str, failed_res
         cmd=failed_result["cmd"],
         error_output=failed_result["output"][:4000],  # 너무 길면 자름
     )
-    fixed = llm.generate(prompt)
+    fixed = llm.generate(prompt, num_predict=8192)
     fixed = _strip_code_fence(fixed)
     apply_change(root, filepath, fixed)
     return fixed

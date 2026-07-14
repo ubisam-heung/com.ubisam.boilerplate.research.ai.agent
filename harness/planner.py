@@ -30,7 +30,7 @@ def make_plan(llm, task: str, file_contents: dict[str, str], guide: str = "") ->
     ) or "(관련 파일 없음)"
 
     prompt = PLAN_PROMPT.format(guide=project_guide.as_prelude(guide), task=task, file_contents=contents_str)
-    plan = llm.generate(prompt, json_mode=True)
+    plan = llm.generate(prompt, json_mode=True, num_predict=4096)
 
     if not isinstance(plan, dict) or "changes" not in plan:
         raise ValueError(f"계획 생성 실패: 잘못된 형식 -> {plan}")

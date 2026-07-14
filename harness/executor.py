@@ -38,7 +38,7 @@ def generate_change(llm, filepath: str, current_content: str, description: str) 
     """새 파일 내용과 unified diff 문자열을 반환"""
     current_display = current_content if current_content else "(새 파일)"
     prompt = CHANGE_PROMPT.format(filepath=filepath, current_content=current_display, description=description)
-    new_content = llm.generate(prompt)
+    new_content = llm.generate(prompt, num_predict=8192)
     new_content = _strip_code_fence(new_content)
 
     diff = difflib.unified_diff(

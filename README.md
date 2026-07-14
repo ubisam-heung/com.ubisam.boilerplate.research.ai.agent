@@ -600,6 +600,7 @@ demo-agent-project/          ← 프레임워크 (바깥)
 | 모델이 너무 느림 / 메모리 부족 | `config.yaml`의 `local_llm.model`을 더 작은 모델로 변경 |
 | `python3: command not found` (WSL) | `sudo apt install -y python3 python3-venv python3-pip` |
 | 외부 CLI 옵션 오류 | `config.yaml`의 `external_tools.*.command` 수정 |
+| local/OpenRouter 응답이 중간에 끊기거나 JSON 파싱 실패 | `backends/local_llm.py`·`backends/openrouter.py`의 `generate()`는 `num_predict` 기본값이 512다. 파일 전체를 다시 쓰는 `executor.py`/`recovery.py`는 8192, 다중 변경 계획을 내는 `planner.py`와 설명 모드(`agent.py`의 `explain_task`)는 4096으로 명시 호출하도록 되어 있다. 같은 모델을 Claude Code 등 외부 도구로 직접 쓸 때보다 답변이 짧게 잘리는 느낌이면 이 상한이 원인일 수 있으니, 호출부에 맞는 `num_predict`가 넘어가는지 먼저 확인한다 |
 
 ---
 
