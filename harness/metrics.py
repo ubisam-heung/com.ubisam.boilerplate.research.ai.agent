@@ -199,7 +199,7 @@ def format_report(summary: dict) -> str:
         "AI Agent 작업 지표 (기대효과 정량화)",
         "─" * 44,
         f"  총 작업 건수            {s['total']}건",
-        f"  백엔드별 처리 분포",
+        "  백엔드별 처리 분포",
     ]
     for key in BACKENDS:
         b = s["backends"].get(key)
@@ -218,7 +218,7 @@ def format_report(summary: dict) -> str:
     lines += [
         f"  로컬 처리 비율          {_pct(s['local_ratio'])}  "
         f"(로컬 {s['local']} / 외부 {s['external']})",
-        f"  └ = 사내 코드 외부 미전송 비율",
+        "  └ = 사내 코드 외부 미전송 비율",
         f"  평균 처리시간           {_num(s['avg_duration_sec'], '초')}",
         f"  평균 에이전틱 스텝 수    {_num(s['avg_steps_taken'])}",
         f"  외부 미전송 토큰(추정)  {s['local_tokens_kept_inhouse']:,} tok",

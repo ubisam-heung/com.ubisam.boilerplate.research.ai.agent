@@ -10,7 +10,6 @@ import os
 import pty
 import re
 import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -40,7 +39,6 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
-from rich.text import Text
 from rich import box
 
 console = Console(highlight=False)
@@ -115,14 +113,14 @@ class SessionRecorder:
         self._path: Optional[Path] = None
 
     def start_turn(self, user_input: str, model: str):
-        self._cur_input = user_input
+        self._cur_input = metrics.redact_sensitive(user_input)
         self._cur_model = model
         self._buf = []
         self.save()
 
     def append(self, line: str):
         if self._cur_input is not None:
-            self._buf.append(line)
+            self._buf.append(metrics.redact_sensitive(line))
             self.save()
 
     def last_turn(self) -> Optional[dict]:
@@ -131,11 +129,12 @@ class SessionRecorder:
     def end_turn(self, interactive: bool = False, tail: str = ""):
         if self._cur_input is None:
             return
+        output = tail if interactive else "\n".join(self._buf)
         self.turns.append({
             "ts": datetime.now().strftime("%H:%M:%S"),
             "model": self._cur_model,
             "input": self._cur_input,
-            "output": (tail if interactive else "\n".join(self._buf))[-_MAX_TAIL_CHARS:],
+            "output": metrics.redact_sensitive(output)[-_MAX_TAIL_CHARS:],
             "interactive": interactive,
         })
         self._cur_input = None
@@ -149,7 +148,7 @@ class SessionRecorder:
                 "ts": datetime.now().strftime("%H:%M:%S"),
                 "model": self._cur_model,
                 "input": self._cur_input,
-                "output": "\n".join(self._buf)[-_MAX_TAIL_CHARS:],
+                "output": metrics.redact_sensitive("\n".join(self._buf))[-_MAX_TAIL_CHARS:],
                 "interactive": False,
                 "in_progress": True,
             }

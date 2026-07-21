@@ -25,7 +25,10 @@ results/
 *.tmp
 *.bak
 claude.md
-docs/
+# docs/는 기본적으로 무시(설치된 프로젝트가 만드는 프로젝트별 문서 폴더용)하되,
+# 프레임워크 자체 문서(docs/OPEN_MODEL.md 등)는 예외로 추적한다.
+docs/*
+!docs/OPEN_MODEL.md
 samples/
 .claude/
 venv

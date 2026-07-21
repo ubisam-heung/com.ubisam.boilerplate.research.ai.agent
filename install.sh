@@ -72,7 +72,7 @@ _ok "Python $PV"
 _step "프레임워크 파일 복사 중..."
 
 FILES=(agent.py cli.py router.py metrics.py config.yaml requirements.txt AGENTS.md doctor.sh)
-DIRS=(backends harness src .agent-harness)
+DIRS=(backends harness src .agent-harness docs)
 
 for f in "${FILES[@]}"; do
     [[ -f "$SCRIPT_DIR/$f" ]] && cp "$SCRIPT_DIR/$f" "$TARGET/$f"

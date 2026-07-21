@@ -66,6 +66,15 @@ harness:
   # DEFAULT_PRICE_PER_MTOK(실제 사용 모델 단가로 맞춰둔 값)를 그대로 쓴다.
   price_per_mtok: null
   verify_timeout_sec: 120
+  # true면 run_command로 실행되는 셸 명령에 전체 환경변수 대신 최소 화이트리스트
+  # (PATH/HOME/LANG 등, harness/verifier.py의 _SANDBOX_ENV_ALLOWLIST 참고)만
+  # 전달한다. AWS_*/*_TOKEN/*_KEY 등 자격증명이 에이전트가 실행하는 명령에
+  # 상속되는 경로를 차단하는 가벼운 격리(컨테이너 격리는 아님). 기본 false —
+  # 대상 프로젝트 빌드가 특정 환경변수에 의존하면 켜기 전 화이트리스트 확인 필요.
+  sandbox_env: false
+  # true면 에이전틱 루프의 매 스텝(도구 호출·결과)을 마스킹 후 logs/trace.jsonl에
+  # 기록한다. 감사(audit)/디버깅용 전체 트레이스. 기본 false(로그 크기 절약).
+  trace_log: false
   backup_dir: ".agent_backup"
   exclude_dirs:
     - node_modules

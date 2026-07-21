@@ -15,11 +15,14 @@ import difflib
 import json
 import os
 import re
+from datetime import datetime
 
-from harness import context, hooks, verifier
+from harness import hooks, verifier
 from harness.executor import (
     BlockApplyError, PathEscapeError, apply_blocks, apply_change, safe_full_path,
 )
+
+TRACE_LOG_FILE = "trace.jsonl"
 
 MAX_STEPS_DEFAULT = 20
 _MAX_TOOL_OUTPUT_CHARS = 4000
@@ -97,6 +100,41 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n... ({len(text) - limit}자 생략)"
+
+
+def _make_trace_writer(cfg: dict):
+    """harness.trace_log가 켜져 있으면, 매 스텝(도구 호출/결과)을 마스킹 후
+    logs/trace.jsonl에 append하는 함수를 반환한다. 꺼져 있으면 아무것도 하지 않는
+    no-op 함수를 반환해 호출부가 매번 옵션 여부를 분기하지 않아도 되게 한다.
+
+    감사(audit)/디버깅 목적의 전체 트레이스. 민감정보는 harness/metrics.py의
+    redact_sensitive()로 마스킹한 뒤 기록한다 — fail-safe로 기록 자체가 실패해도
+    에이전트 실행에는 영향을 주지 않는다.
+    """
+    harness_cfg = cfg.get("harness", {})
+    if not harness_cfg.get("trace_log", False):
+        return lambda step, action, result: None
+
+    from harness import metrics as _metrics
+    log_dir = cfg.get("logging", {}).get("log_dir", "logs")
+    path = os.path.join(log_dir, TRACE_LOG_FILE)
+
+    def _write(step: int, action: dict, result: str):
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            row = {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "step": step,
+                "action": {k: _metrics.redact_sensitive(str(v)) if isinstance(v, str) else v
+                           for k, v in action.items()},
+                "result": _metrics.redact_sensitive(_truncate(result, _MAX_TOOL_OUTPUT_CHARS)),
+            }
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # trace log는 부가 기능 — 기록 실패가 작업 실행을 막으면 안 된다.
+
+    return _write
 
 
 def _dispatch(action: dict, work_root: str, hook_roots, cfg: dict, log_fn,
@@ -231,7 +269,8 @@ def _dispatch(action: dict, work_root: str, hook_roots, cfg: dict, log_fn,
             if confirm_fn is not None and not confirm_fn(f"다음 명령을 실행할까요?\n$ {command}"):
                 return f"사용자가 명령 실행을 거부했습니다: {command}", False
         timeout = cfg.get("harness", {}).get("verify_timeout_sec", 120)
-        results = verifier.run_verification([command], work_root, timeout)
+        sandbox_env = cfg.get("harness", {}).get("sandbox_env", False)
+        results = verifier.run_verification([command], work_root, timeout, sandbox_env=sandbox_env)
         r = results[0]
         status = "성공(exit 0)" if r["success"] else f"실패(exit {r['returncode']})"
         return f"{status}\n{_truncate(r['output'], _MAX_TOOL_OUTPUT_CHARS)}", False
@@ -290,6 +329,8 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
     last_signature = None
     repeat_count = 0
 
+    trace = _make_trace_writer(cfg)
+
     def _cumulative_cost_usd() -> float:
         """지금까지 이 llm 인스턴스가 소모한 누적 비용(추정, 달러).
 
@@ -316,14 +357,18 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
             action = llm.generate(prompt, system=system, json_mode=True, num_predict=1024)
         except Exception as exc:
             log_fn(f"[에이전틱] 스텝 {step}: 모델 호출 실패 - {exc}")
-            history_entries.append(_fmt_step(step, {"tool": "?"}, f"오류: 모델 호출 실패 - {exc}"))
+            error_msg = f"오류: 모델 호출 실패 - {exc}"
+            history_entries.append(_fmt_step(step, {"tool": "?"}, error_msg))
+            trace(step, {"tool": "?"}, error_msg)
             steps_taken = step
             last_signature = None
             repeat_count = 0
         else:
             if not isinstance(action, dict) or "tool" not in action:
                 log_fn(f"[에이전틱] 스텝 {step}: 잘못된 응답 형식 - {action!r}")
-                history_entries.append(_fmt_step(step, {"tool": "?"}, "오류: 도구 호출 JSON 형식이 아닙니다. {\"tool\": ...} 형식으로 답해라."))
+                error_msg = "오류: 도구 호출 JSON 형식이 아닙니다. {\"tool\": ...} 형식으로 답해라."
+                history_entries.append(_fmt_step(step, {"tool": "?"}, error_msg))
+                trace(step, {"tool": "?", "raw": repr(action)}, error_msg)
                 steps_taken = step
                 last_signature = None
                 repeat_count = 0
@@ -331,6 +376,7 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
                 log_fn(f"[에이전틱] 스텝 {step}: {action.get('tool')} {action.get('path') or action.get('pattern') or action.get('command') or ''}")
                 result, finished = _dispatch(action, work_root, hook_roots, cfg, log_fn, mode=mode, confirm_fn=confirm_fn)
                 steps_taken = step
+                trace(step, action, result)
 
                 if action.get("tool") == "write_file" and "오류" not in result and "차단" not in result and "거부" not in result:
                     path = action.get("path")

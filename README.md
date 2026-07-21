@@ -31,6 +31,7 @@
 - [10. 동작 확인 체크리스트](#10-동작-확인-체크리스트)
 - [11. 문제 해결](#11-문제-해결)
 - [12. GitHub 리포지토리 연동 & PR 워크플로우](#12-github-리포지토리-연동--pr-워크플로우)
+- [13. CI (GitHub Actions)](#13-ci-github-actions)
 
 ---
 
@@ -138,6 +139,10 @@ ollama pull qwen2.5-coder:7b   # 메인 코딩 모델
 
 > **메모리 권장**: 7B Q4 모델 기준 RAM 16GB 이상을 권장합니다. 사양이 낮으면
 > `config.yaml`의 `local_llm.model`을 더 작은 모델로 바꾸세요.
+
+> **Open Model 선택 근거·라이선스·벤치마크**: 이 모델(Qwen 계열)을 고른 이유, 라이선스(Apache-2.0)
+> 검토, 보안 검토, 로컬/OpenRouter 정성 비교는 [docs/OPEN_MODEL.md](docs/OPEN_MODEL.md)에
+> 정리되어 있습니다.
 
 설치 확인:
 
@@ -260,7 +265,7 @@ cd ~/com.ubisam.boilerplate.research.ai.agent
 `update.sh`가 덮어쓰는 것:
 
 - `agent.py`, `cli.py`, `router.py`, `metrics.py`, `conftest.py`, `doctor.sh`, `requirements.txt`
-- `backends/`, `harness/`, `src/`
+- `backends/`, `harness/`, `src/`, `docs/`
 
 **건드리지 않는 것** — 프로젝트별 상태/설정은 그대로 유지됩니다:
 
@@ -478,6 +483,8 @@ agent (local) ❯ /mode manual
 | `harness.default_mode` | 권한 모드 기본값: `manual` \| `edit-only` \| `auto` (기본 `edit-only`, [6-2](#6-2-권한-모드-mode) 참고) |
 | `harness.agentic_max_steps` | 에이전틱 루프가 `done` 없이 반복할 수 있는 최대 스텝 수 (기본 20) |
 | `harness.verify_timeout_sec` | 검증 명령(run_command) 타임아웃 초 (기본 120) |
+| `harness.sandbox_env` | `true`면 `run_command`에 전체 환경변수 대신 최소 화이트리스트만 전달(자격증명 미상속). 기본 `false` — [8. 가드레일](#8-가드레일--안전장치) 참고 |
+| `harness.trace_log` | `true`면 에이전틱 루프의 매 스텝(도구 호출/결과)을 마스킹 후 `logs/trace.jsonl`에 기록. 기본 `false` |
 | `harness.backup_dir` | 변경 전 백업 디렉토리 (기본 `.agent_backup`) |
 | `harness.exclude_dirs` | 파일 탐색에서 제외할 디렉토리 |
 | `sessions.dir` | 대화 세션 JSON 저장 디렉토리. 진행 중에도 실시간에 가깝게 갱신 |
@@ -512,6 +519,21 @@ OpenRouter를 쓰려면 `openrouter.enabled: true`와 `api_key`(또는 `OPENROUT
     `sudo`·`shutdown`·`mkfs`·`dd` 등 시스템 변경 명령 차단
   - `pre-file` — `.env`, SSH 키, 클라우드 credential 등 민감 파일 접근 차단
   - `post-edit` — Python 파일 수정 후 `ruff`가 있으면 `ruff check` 실행
+- **환경변수 격리(`harness.sandbox_env`)** — `true`로 켜면 `run_command`로 실행되는 셸 명령에
+  전체 환경변수 대신 최소 화이트리스트(`PATH`/`HOME`/`LANG` 등, `harness/verifier.py`의
+  `_SANDBOX_ENV_ALLOWLIST`)만 전달합니다. `AWS_*`/`*_TOKEN`/`*_KEY` 같은 자격증명이 에이전트가
+  실행하는 명령에 그대로 상속되는 경로를 차단합니다. 컨테이너/네임스페이스 수준의 완전한 격리는
+  아니며, hook 기반 차단(블랙리스트)을 보완하는 화이트리스트 방식의 가벼운 조치입니다. 기본값은
+  `false`이며, 대상 프로젝트 빌드가 특정 환경변수(예: SDK 경로)에 의존한다면 켜기 전 화이트리스트에
+  추가해야 합니다.
+- **PII/Secret 마스킹** — `harness/metrics.py`의 `redact_sensitive()`가 password/token/api key/
+  license key 패턴을 `[REDACTED]`로 치환합니다. 적용 범위: 작업 지표(`logs/metrics.jsonl`)의
+  `task` 필드, 대화 세션 저장(`sessions/*.json`)의 입력·출력, 트레이스 로그(`logs/trace.jsonl`,
+  아래 참고) 전체.
+- **Trace Log(`harness.trace_log`)** — `true`로 켜면 에이전틱 루프의 매 스텝(도구 호출과 그 결과)을
+  마스킹 후 `logs/trace.jsonl`에 JSONL로 기록합니다. 감사(audit)나 실패 재현이 필요할 때 각 스텝에서
+  실제로 어떤 도구가 어떤 인자로 호출됐고 무엇이 반환됐는지 그대로 재구성할 수 있습니다. 기본값은
+  `false`(로그 크기 절약)이며, 기록 자체가 실패해도 에이전트 실행에는 영향을 주지 않습니다(fail-safe).
 
 ### 프로젝트별 hook
 
@@ -735,5 +757,32 @@ main (보호됨)
  ├─ claude ──[작업]──▶ Pull Request ──▶ merge ──▶ git pull origin main
  └─ codex  ──[작업]──▶ Pull Request ──▶ merge ──▶ git pull origin main
 ```
+
+---
+
+## 13. CI (GitHub Actions)
+
+`main`/`claude`/`codex` 브랜치 push와 `main` 대상 PR마다 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)이
+자동 실행됩니다. GitHub 리포지토리로 push하면 별도 설정 없이 곧바로 동작합니다.
+
+| 단계 | 내용 |
+|---|---|
+| Lint | `ruff check .` — 미사용 import, 문법 이슈 등 정적 검사 |
+| Test | `pytest -q` — [tests/](tests/)의 라우팅(`router.py`)·파일 적용(`harness/executor.py`) 회귀 테스트 |
+
+로컬에서 동일하게 실행하려면:
+
+```bash
+pip install ruff pytest
+ruff check .
+pytest -q
+```
+
+PR을 열면 GitHub 화면에 체크 결과가 표시되며, Branch Protection Ruleset에 필수 체크로 등록하면
+CI 통과 전에는 merge를 막을 수 있습니다(**Settings → Rules → Rulesets → Require status checks**).
+
+> gen3처럼 Windows/.NET(MSBuild) 빌드가 필요한 **대상 프로젝트**(workspace 안)의 CI는 이 워크플로우의
+> 범위 밖입니다. Windows self-hosted runner로 `Run-Tests.ps1` 등을 트리거하는 별도 워크플로우가 필요하며,
+> 현재는 문서화된 다음 단계로만 남아 있습니다.
 
 ---

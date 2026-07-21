@@ -66,7 +66,7 @@ fi
 _step "프레임워크 파일 갱신 중..."
 
 FILES=(agent.py cli.py router.py metrics.py conftest.py doctor.sh requirements.txt)
-DIRS=(backends harness src)
+DIRS=(backends harness src docs)
 
 for f in "${FILES[@]}"; do
     if [[ -f "$SCRIPT_DIR/$f" ]]; then
