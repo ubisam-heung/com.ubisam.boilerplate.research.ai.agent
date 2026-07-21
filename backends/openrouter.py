@@ -25,6 +25,14 @@ _CACHE_MIN_CHARS = 2000
 # cache_control 블록을 보내면 provider가 거부할 수 있어 접두어로 판별한다.
 _CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/",)
 
+# OpenRouter 대시보드의 App 컬럼에 표시될 이름. HTTP-Referer/X-Title 헤더가 없으면
+# 요청 출처가 "Unknown"으로만 표시되고 이름/아이콘이 뜨지 않는다(OpenRouter API 문서
+# 기준 App attribution 헤더 — https://openrouter.ai/docs 참고, 실측으로도 확인함:
+# 이 헤더를 보내는 다른 클라이언트는 App 컬럼에 이름+아이콘이 뜨고, 안 보내는 요청은
+# Unknown으로 뜬다). 과금/캐싱 등 실제 동작에는 영향 없이 대시보드 식별용이다.
+_APP_TITLE = "Ubisam-HJ-Agent"
+_APP_REFERER = "https://github.com/ubisam-research/com.ubisam.boilerplate.research.ai.agent"
+
 
 class OpenRouterLLM:
     def __init__(self, model: str, api_key: str = "",
@@ -125,7 +133,11 @@ class OpenRouterLLM:
         return requests.post(
             f"{self.base_url}/chat/completions",
             json=payload,
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "HTTP-Referer": _APP_REFERER,
+                "X-Title": _APP_TITLE,
+            },
             timeout=300,
         )
 
