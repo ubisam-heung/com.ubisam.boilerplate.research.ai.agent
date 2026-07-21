@@ -161,6 +161,26 @@ def summarize(records: list, price_per_mtok: float = DEFAULT_PRICE_PER_MTOK) -> 
         m = r.get("selected_model") or "(알 수 없음)"
         by_model[m] = by_model.get(m, 0) + 1
 
+    # 코드 변경 완료율: outcome이 completed/failed인 건만 대상으로 한다(explain/chatter/
+    # interactive 등 코드 수정을 시도하지 않은 건은 분모에서 제외). "Task 성공률"을
+    # 심사위원이 로그를 직접 열어보지 않아도 리포트에서 바로 확인할 수 있게 한다.
+    outcome_counts: dict[str, int] = {}
+    for r in records:
+        oc = r.get("outcome")
+        if oc:
+            outcome_counts[oc] = outcome_counts.get(oc, 0) + 1
+    completed = outcome_counts.get("completed", 0)
+    failed = outcome_counts.get("failed", 0)
+    attempted = completed + failed
+    interactive = outcome_counts.get("interactive", 0)
+
+    # 외부 CLI(claude/codex) 대화형 세션의 성공/실패는 자동 판정이 불가능해 세션 종료
+    # 시점에 사람이 직접 태깅한다(cli.py의 _ask_session_outcome). session_outcome이
+    # 없는(옛 로그·비대화형 실행) 레코드는 "unknown"으로 취급해 조용히 제외한다.
+    session_success = sum(1 for r in records if r.get("session_outcome") == "success")
+    session_failure = sum(1 for r in records if r.get("session_outcome") == "failure")
+    session_tagged = session_success + session_failure
+
     return {
         "total": total,
         "routed_total": routed_total,
@@ -180,6 +200,15 @@ def summarize(records: list, price_per_mtok: float = DEFAULT_PRICE_PER_MTOK) -> 
         "auto_model_count": len(scored),
         "auto_model_avg_score": (sum(scores) / len(scores)) if scores else None,
         "auto_model_by_model": by_model,
+        "completed": completed,
+        "failed": failed,
+        "attempted": attempted,
+        "completion_rate": _ratio(completed, attempted),
+        "interactive": interactive,
+        "session_success": session_success,
+        "session_failure": session_failure,
+        "session_tagged": session_tagged,
+        "session_success_rate": _ratio(session_success, session_tagged),
     }
 
 
@@ -235,5 +264,18 @@ def format_report(summary: dict) -> str:
         lines.append(f"  자동 모델 선택 건수      {s['auto_model_count']}건 (평균 복잡도 점수 {_num(s['auto_model_avg_score'])})")
         for model, count in sorted(s["auto_model_by_model"].items(), key=lambda kv: -kv[1]):
             lines.append(f"    └ {model:<28} {count}건")
+    if s.get("attempted"):
+        lines.append(
+            f"  코드 변경 완료율        {_pct(s['completion_rate'])}  "
+            f"(완료 {s['completed']} / 실패 {s['failed']})"
+        )
+    if s.get("interactive"):
+        lines.append(f"  외부 CLI 대화형 세션    {s['interactive']}건")
+        if s.get("session_tagged"):
+            lines.append(
+                f"    └ 세션 성공률          {_pct(s['session_success_rate'])}  "
+                f"(성공 {s['session_success']} / 실패 {s['session_failure']}, "
+                f"{s['session_tagged']}/{s['interactive']}건 태깅됨)"
+            )
     lines.append("─" * 44)
     return "\n".join(lines)

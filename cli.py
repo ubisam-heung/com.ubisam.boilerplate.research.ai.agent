@@ -261,6 +261,31 @@ def _rich_confirm(question: str) -> bool:
     return ans.strip().lower() in ("y", "yes")
 
 
+def _ask_session_outcome() -> str:
+    """claude/codex 대화형 세션 종료 직후 성공/실패를 짧게 묻는다.
+
+    자동 라우팅(local/openrouter) 구간은 done/max_steps 등으로 성공 여부가
+    코드로 판정되지만, 대화형 핸드오프는 사람이 직접 조작하므로 그 안에서
+    무슨 일이 있었는지 metrics에 전혀 남지 않는다. 세션 종료 시점에 한 번만
+    물어 outcome을 보강한다 — 비대화형(stdin이 tty 아님)이거나 입력을
+    건너뛰면 "unknown"으로 남겨 기존 동작과 호환한다.
+    """
+    if not sys.stdin.isatty():
+        return "unknown"
+    try:
+        ans = console.input(
+            "  [dim]방금 세션에서 작업이 잘 끝났나요? [/dim][dim]\\[y/n/엔터=건너뛰기][/dim] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return "unknown"
+    if ans in ("y", "yes"):
+        return "success"
+    if ans in ("n", "no"):
+        return "failure"
+    return "unknown"
+
+
 def _rich_log(message: str):
     """에이전트 print 출력을 Rich 스타일로 변환."""
     msg = message.rstrip()
@@ -697,13 +722,16 @@ def _run_external_interactive(model: str, task: str, work_root: str, config: dic
     except KeyboardInterrupt:
         pass
 
+    console.print()
+    session_outcome = _ask_session_outcome()
+
     log_dir = config.get("logging", {}).get("log_dir", "logs")
     metrics.record_run(log_dir, {
         "task": task[:200], "decision": "external", "outcome": "interactive",
         "tool": model, "duration_sec": round(time.monotonic() - t0, 2),
+        "session_outcome": session_outcome,
     })
 
-    console.print()
     console.print(Rule(f"[dim]{model} 세션 종료 — agent로 복귀[/dim]", style="dim"))
     console.print()
     return tail
