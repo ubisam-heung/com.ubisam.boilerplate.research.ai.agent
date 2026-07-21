@@ -11,15 +11,29 @@ import yaml
 from backends.local_llm import LocalLLM
 from backends.openrouter import OpenRouterLLM
 from backends import claude_code_cli, codex_cli
-from router import is_chatter, reply_chatter, pick_external_tool, tool_enabled
+from router import is_chatter, reply_chatter, pick_external_tool, tool_enabled, pick_openrouter_model
 from harness import context, hooks, metrics, project_guide, agentic_loop
 
 
-def _build_main_llm(cfg: dict):
+def _resolve_openrouter_model(or_cfg: dict, task: str | None, conversation_history: list[str] | None) -> tuple[str, int | None]:
+    """openrouter.auto_model이 켜져 있으면 작업 복잡도에 맞는 모델을 고르고,
+    아니면 openrouter.model(고정 모델)을 그대로 쓴다.
+
+    반환값: (모델명, 산정된 복잡도 점수 — auto_model이 꺼져 있으면 None).
+    """
+    if or_cfg.get("auto_model", False) and task:
+        model, score = pick_openrouter_model({"openrouter": or_cfg}, task, conversation_history)
+        return model, score
+    return or_cfg.get("model", ""), None
+
+
+def _build_main_llm(cfg: dict, task: str | None = None, conversation_history: list[str] | None = None,
+                     log_fn=None):
     """파이프라인(파일선택/계획/라우팅/잡담판단)에 쓸 메인 LLM을 고른다.
 
     local_llm이 켜져 있으면 그걸 쓰고, 꺼져 있으면 openrouter를 시도한다.
     둘 다 꺼져 있으면 None(호출 측에서 외부 도구로 위임).
+    task/conversation_history는 openrouter.auto_model 판단에만 쓰인다.
     """
     llm_cfg = cfg.get("local_llm", {})
     if llm_cfg.get("enabled", True):
@@ -30,12 +44,19 @@ def _build_main_llm(cfg: dict):
         )
     or_cfg = cfg.get("openrouter", {})
     if or_cfg.get("enabled", False):
-        return OpenRouterLLM(
-            model=or_cfg.get("model", ""),
+        model, score = _resolve_openrouter_model(or_cfg, task, conversation_history)
+        if score is not None and log_fn is not None:
+            log_fn(f"[OpenRouter] 자동 모델 선택: {model} (복잡도 점수 {score})")
+        llm = OpenRouterLLM(
+            model=model,
             api_key=or_cfg.get("api_key", ""),
             base_url=or_cfg.get("base_url", "https://openrouter.ai/api/v1"),
             temperature=or_cfg.get("temperature", 0.2),
+            cache_system=or_cfg.get("cache_system", True),
         )
+        # metrics 기록용 — _rec()가 나중에 complexity_score를 꺼내 쓸 수 있게 붙여둔다.
+        llm.complexity_score = score
+        return llm
     return None
 
 
@@ -51,17 +72,29 @@ def _build_local_llm(cfg: dict):
     )
 
 
-def _build_openrouter_llm(cfg: dict):
-    """OpenRouter가 켜져 있으면 별도 위임용 LLM을 만든다."""
+def _build_openrouter_llm(cfg: dict, task: str | None = None, conversation_history: list[str] | None = None,
+                           log_fn=None):
+    """OpenRouter가 켜져 있으면 별도 위임용 LLM을 만든다.
+
+    openrouter.auto_model이 켜져 있고 task가 주어지면, 작업 복잡도에 맞는
+    모델을 openrouter.models 목록에서 골라 연결한다(router.pick_openrouter_model).
+    """
     or_cfg = cfg.get("openrouter", {})
     if not or_cfg.get("enabled", False):
         return None
-    return OpenRouterLLM(
-        model=or_cfg.get("model", ""),
+    model, score = _resolve_openrouter_model(or_cfg, task, conversation_history)
+    if score is not None and log_fn is not None:
+        log_fn(f"[OpenRouter] 자동 모델 선택: {model} (복잡도 점수 {score})")
+    llm = OpenRouterLLM(
+        model=model,
         api_key=or_cfg.get("api_key", ""),
         base_url=or_cfg.get("base_url", "https://openrouter.ai/api/v1"),
         temperature=or_cfg.get("temperature", 0.2),
+        cache_system=or_cfg.get("cache_system", True),
     )
+    # metrics 기록용 — _rec()가 나중에 complexity_score를 꺼내 쓸 수 있게 붙여둔다.
+    llm.complexity_score = score
+    return llm
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -366,9 +399,9 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     if force == "local":
         main_llm = _build_local_llm(cfg)
     elif force == "openrouter":
-        main_llm = _build_openrouter_llm(cfg)
+        main_llm = _build_openrouter_llm(cfg, task=task, conversation_history=conversation_history, log_fn=log_fn)
     else:
-        main_llm = _build_main_llm(cfg)
+        main_llm = _build_main_llm(cfg, task=task, conversation_history=conversation_history, log_fn=log_fn)
 
     if force == "local" and main_llm is None:
         log_fn("[오류] local_llm이 config.yaml에서 비활성화되어 있습니다.")
@@ -451,16 +484,30 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
         conversation_history=conversation_history,
     )
 
+    cache_extra = {}
+    if isinstance(main_llm, OpenRouterLLM):
+        stats = main_llm.cache_stats()
+        if stats.get("cache_read_tokens") or stats.get("cache_write_tokens"):
+            cache_extra["cache_read_tokens"] = stats["cache_read_tokens"]
+            cache_extra["cache_write_tokens"] = stats["cache_write_tokens"]
+        # auto_model로 선택된 경우에만 채워짐(고정 모델이면 None) — 나중에
+        # 점수대별 모델 배분/임계값 튜닝 근거로 쓴다.
+        score = getattr(main_llm, "complexity_score", None)
+        if score is not None:
+            cache_extra["complexity_score"] = score
+            cache_extra["selected_model"] = main_llm.model
+
     if result.get("success"):
         _rec(backend, "completed",
              steps_taken=result.get("steps_taken", 0),
-             files_touched=result.get("files_touched", []))
+             files_touched=result.get("files_touched", []),
+             **cache_extra)
         log_fn("\n[작업 종료]")
         return
 
     if force in ("local", "openrouter"):
         log_fn(f"[안내] {backend}가 작업을 완료하지 못했습니다({result.get('reason')}).")
-        _rec(backend, "failed", reason=result.get("reason"))
+        _rec(backend, "failed", reason=result.get("reason"), **cache_extra)
         return
 
     tool = pick_external_tool(cfg)

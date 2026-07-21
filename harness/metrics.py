@@ -7,6 +7,7 @@
 """
 import json
 import os
+import re
 from datetime import datetime
 
 METRICS_FILE = "metrics.jsonl"
@@ -14,12 +15,38 @@ METRICS_FILE = "metrics.jsonl"
 # 외부 LLM 100만 토큰당 추정 단가(USD). 실제 사용 모델 단가로 바꿔도 됨.
 DEFAULT_PRICE_PER_MTOK = 3.0
 
+# task 원문에 섞여 들어올 수 있는 민감정보(비밀번호/토큰/API 키/라이선스 키)를
+# 키-값 패턴으로 탐지해 마스킹한다. gen3(workspace 프로젝트)의
+# UbiCom.Net/Utility/Security/SensitiveLogRedactor.cs 마스킹 정책을 이식.
+_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|api[_ -]?key|license[_ -]?key)\b"
+    r"(\s*[:=]\s*)"
+    r"(\"[^\"]*\"|'[^']*'|\S+)",
+)
+_REDACTED_VALUE = r"\1\2[REDACTED]"
+
+
+def redact_sensitive(text: str) -> str:
+    """password/token/api key/license key 등 키-값 쌍을 [REDACTED]로 마스킹한다.
+
+    마스킹 자체가 실패해도 원문을 그대로 흘리지 않고 안전한 대체 문자열을 반환한다
+    (fail-safe — SensitiveLogRedactor.cs와 동일한 원칙).
+    """
+    if not text:
+        return text
+    try:
+        return _SENSITIVE_KEY_PATTERN.sub(_REDACTED_VALUE, text)
+    except Exception:
+        return "[REDACTION_FAILED]"
+
 
 def record_run(log_dir: str, data: dict) -> str:
     """작업 실행 1건을 JSONL로 추가 기록한다. 실패해도 조용히 넘어간다."""
     try:
         os.makedirs(log_dir, exist_ok=True)
         path = os.path.join(log_dir, METRICS_FILE)
+        if isinstance(data.get("task"), str):
+            data = {**data, "task": redact_sensitive(data["task"])}
         row = {"ts": datetime.now().isoformat(timespec="seconds"), **data}
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -116,6 +143,24 @@ def summarize(records: list, price_per_mtok: float = DEFAULT_PRICE_PER_MTOK) -> 
     steps = [int(r["steps_taken"]) for r in records
               if isinstance(r.get("steps_taken"), (int, float))]
 
+    # OpenRouter 프롬프트 캐싱 통계 (backends/openrouter.py의 cache_stats()가
+    # agent.py를 통해 기록). 캐시 읽기는 정가의 약 10%로 청구되므로, 캐시가
+    # 없었다면 그 토큰도 풀프라이스였을 것이라는 가정으로 절감액을 추정한다.
+    cache_read = sum(int(r.get("cache_read_tokens") or 0) for r in records)
+    cache_write = sum(int(r.get("cache_write_tokens") or 0) for r in records)
+    cache_savings_usd = cache_read / 1_000_000 * price_per_mtok * 0.9
+
+    # openrouter.auto_model 자동 모델 선택 통계 (router.pick_openrouter_model이
+    # 산정한 complexity_score/selected_model — agent.py가 auto_model일 때만 기록).
+    # 점수 자체는 router._HARD_KEYWORDS 등 임계값 튜닝 근거로, 모델별 건수는
+    # 실제로 어떤 등급 모델이 얼마나 선택됐는지 확인하는 용도.
+    scored = [r for r in records if r.get("complexity_score") is not None]
+    scores = [int(r["complexity_score"]) for r in scored]
+    by_model = {}
+    for r in scored:
+        m = r.get("selected_model") or "(알 수 없음)"
+        by_model[m] = by_model.get(m, 0) + 1
+
     return {
         "total": total,
         "routed_total": routed_total,
@@ -129,6 +174,12 @@ def summarize(records: list, price_per_mtok: float = DEFAULT_PRICE_PER_MTOK) -> 
         "local_tokens_kept_inhouse": local_tokens,
         "cost_avoided_usd": local_tokens / 1_000_000 * price_per_mtok,
         "price_per_mtok": price_per_mtok,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "cache_savings_usd": cache_savings_usd,
+        "auto_model_count": len(scored),
+        "auto_model_avg_score": (sum(scores) / len(scores)) if scores else None,
+        "auto_model_by_model": by_model,
     }
 
 
@@ -173,6 +224,16 @@ def format_report(summary: dict) -> str:
         f"  외부 미전송 토큰(추정)  {s['local_tokens_kept_inhouse']:,} tok",
         f"  추정 비용 절감          ${s['cost_avoided_usd']:.2f}  "
         f"(@${s['price_per_mtok']}/1M tok)",
-        "─" * 44,
     ]
+    if s.get("cache_read_tokens") or s.get("cache_write_tokens"):
+        lines += [
+            f"  OpenRouter 프롬프트 캐시 읽기  {s['cache_read_tokens']:,} tok",
+            f"  OpenRouter 프롬프트 캐시 쓰기  {s['cache_write_tokens']:,} tok",
+            f"  캐싱으로 절감(추정)          ${s['cache_savings_usd']:.2f}",
+        ]
+    if s.get("auto_model_count"):
+        lines.append(f"  자동 모델 선택 건수      {s['auto_model_count']}건 (평균 복잡도 점수 {_num(s['auto_model_avg_score'])})")
+        for model, count in sorted(s["auto_model_by_model"].items(), key=lambda kv: -kv[1]):
+            lines.append(f"    └ {model:<28} {count}건")
+    lines.append("─" * 44)
     return "\n".join(lines)

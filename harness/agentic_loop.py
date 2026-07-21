@@ -24,8 +24,16 @@ from harness.executor import (
 MAX_STEPS_DEFAULT = 20
 _MAX_TOOL_OUTPUT_CHARS = 4000
 _MAX_READ_CHARS = 12000
+_HISTORY_KEEP = 30
 MODES = ("manual", "edit-only", "auto")
 DEFAULT_MODE = "edit-only"
+
+# 동일/유사한 도구 호출이 이만큼 연속으로 반복되면(진행 없이 토큰만 소모하는
+# 루프로 간주) done/max_steps를 기다리지 않고 즉시 중단한다.
+_REPEAT_LOOP_THRESHOLD = 3
+# 작업 1건 비용 상한 기본값(달러). config.yaml의 harness.max_cost_usd로 조정 가능.
+# None/0이면 비활성화.
+_MAX_COST_USD_DEFAULT = None
 
 SYSTEM_PROMPT = """당신은 코딩 에이전트다. 아래 도구를 매 턴 하나씩 호출해서
 작업을 완료해라. 파일 내용을 추측하지 말고, 필요하면 반드시 read_file이나
@@ -70,6 +78,19 @@ TURN_PROMPT = """지금까지 진행 이력:
 
 def _fmt_step(i: int, action: dict, result: str) -> str:
     return f"--- 스텝 {i} ---\n호출: {json.dumps(action, ensure_ascii=False)}\n결과:\n{result}\n"
+
+
+def _action_signature(action: dict) -> str:
+    """도구 호출을 반복 감지용으로 비교할 수 있는 문자열로 정규화한다.
+
+    write_file은 매번 다른 content/search/replace를 담고 있어도 같은 파일에
+    대한 반복 시도는 "진행 없음"의 신호이므로 path만 본다. 나머지 도구는
+    입력 전체(JSON)가 같아야 진짜 반복으로 본다.
+    """
+    tool = action.get("tool")
+    if tool == "write_file":
+        return f"write_file:{action.get('path')}"
+    return json.dumps(action, ensure_ascii=False, sort_keys=True)
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -230,7 +251,11 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
     """에이전틱 루프를 실행한다.
 
     모델이 매 스텝 도구 호출 JSON을 하나 반환하면 실행하고 결과를 이력에
-    쌓아 다음 프롬프트에 넘긴다. done 호출 또는 max_steps 도달 시 종료.
+    쌓아 다음 프롬프트에 넘긴다. 종료 조건은 다음 중 하나:
+      - done 호출
+      - max_steps 도달
+      - 동일/유사 도구 호출이 연속으로 반복되는 루프 감지(repeat_loop_detected)
+      - 누적 비용이 harness.max_cost_usd를 초과(cost_limit_exceeded, 설정된 경우만)
 
     mode: "manual"(전부 승인) | "edit-only"(파일수정 자동, 명령만 승인)
           | "auto"(전부 자동). confirm_fn: 승인 질문(question:str) -> bool.
@@ -238,7 +263,14 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
           "이번에 추가한 기능"처럼 이전 턴을 참조하는 후속 질문을 모델이 이해하도록
           시스템 프롬프트에 짧게 얹는다. None/빈 리스트면 생략.
     """
-    max_steps = max_steps or cfg.get("harness", {}).get("agentic_max_steps", MAX_STEPS_DEFAULT)
+    harness_cfg = cfg.get("harness", {})
+    max_steps = max_steps or harness_cfg.get("agentic_max_steps", MAX_STEPS_DEFAULT)
+    max_cost_usd = harness_cfg.get("max_cost_usd", _MAX_COST_USD_DEFAULT)
+    price_per_mtok = harness_cfg.get("price_per_mtok")
+    if price_per_mtok is None:
+        from harness import metrics as _metrics
+        price_per_mtok = _metrics.DEFAULT_PRICE_PER_MTOK
+
     conv_text = ""
     if conversation_history:
         recent = conversation_history[-5:]
@@ -253,6 +285,29 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
     steps_taken = 0
     files_touched = []
     done_summary = None
+    stop_reason = None
+
+    last_signature = None
+    repeat_count = 0
+
+    def _cumulative_cost_usd() -> float:
+        """지금까지 이 llm 인스턴스가 소모한 누적 비용(추정, 달러).
+
+        OpenRouterLLM은 cache_stats()로 캐시 통계까지 포함한 실제 usage를
+        누적 제공한다(캐시 읽기는 ~10% 단가). 그 외(LocalLLM 등)는 비용
+        개념이 없으므로 0으로 취급해 상한 검사를 건너뛴다.
+        """
+        cache_stats = getattr(llm, "cache_stats", None)
+        if cache_stats is None:
+            return 0.0
+        stats = cache_stats()
+        full_price_tokens = (
+            stats.get("prompt_tokens", 0) + stats.get("completion_tokens", 0)
+            - stats.get("cache_read_tokens", 0)
+        )
+        cost = full_price_tokens / 1_000_000 * price_per_mtok
+        cost += stats.get("cache_read_tokens", 0) / 1_000_000 * price_per_mtok * 0.1
+        return max(cost, 0.0)
 
     for step in range(1, max_steps + 1):
         history_text = "".join(history_entries) or "(아직 없음)"
@@ -263,39 +318,62 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
             log_fn(f"[에이전틱] 스텝 {step}: 모델 호출 실패 - {exc}")
             history_entries.append(_fmt_step(step, {"tool": "?"}, f"오류: 모델 호출 실패 - {exc}"))
             steps_taken = step
-            continue
+            last_signature = None
+            repeat_count = 0
+        else:
+            if not isinstance(action, dict) or "tool" not in action:
+                log_fn(f"[에이전틱] 스텝 {step}: 잘못된 응답 형식 - {action!r}")
+                history_entries.append(_fmt_step(step, {"tool": "?"}, "오류: 도구 호출 JSON 형식이 아닙니다. {\"tool\": ...} 형식으로 답해라."))
+                steps_taken = step
+                last_signature = None
+                repeat_count = 0
+            else:
+                log_fn(f"[에이전틱] 스텝 {step}: {action.get('tool')} {action.get('path') or action.get('pattern') or action.get('command') or ''}")
+                result, finished = _dispatch(action, work_root, hook_roots, cfg, log_fn, mode=mode, confirm_fn=confirm_fn)
+                steps_taken = step
 
-        if not isinstance(action, dict) or "tool" not in action:
-            log_fn(f"[에이전틱] 스텝 {step}: 잘못된 응답 형식 - {action!r}")
-            history_entries.append(_fmt_step(step, {"tool": "?"}, "오류: 도구 호출 JSON 형식이 아닙니다. {\"tool\": ...} 형식으로 답해라."))
-            steps_taken = step
-            continue
+                if action.get("tool") == "write_file" and "오류" not in result and "차단" not in result and "거부" not in result:
+                    path = action.get("path")
+                    if path and path not in files_touched:
+                        files_touched.append(path)
 
-        log_fn(f"[에이전틱] 스텝 {step}: {action.get('tool')} {action.get('path') or action.get('pattern') or action.get('command') or ''}")
-        result, finished = _dispatch(action, work_root, hook_roots, cfg, log_fn, mode=mode, confirm_fn=confirm_fn)
-        steps_taken = step
+                history_entries.append(_fmt_step(step, action, _truncate(result, _MAX_TOOL_OUTPUT_CHARS)))
+                # 이력이 너무 길어지지 않게 최근 N개만 유지 (오래된 스텝은 요약 없이 버림)
+                if len(history_entries) > _HISTORY_KEEP:
+                    history_entries = history_entries[-_HISTORY_KEEP:]
 
-        if action.get("tool") == "write_file" and "오류" not in result and "차단" not in result and "거부" not in result:
-            path = action.get("path")
-            if path and path not in files_touched:
-                files_touched.append(path)
+                if finished:
+                    done_summary = result
+                    break
 
-        history_entries.append(_fmt_step(step, action, _truncate(result, _MAX_TOOL_OUTPUT_CHARS)))
-        # 이력이 너무 길어지지 않게 최근 N개만 유지 (오래된 스텝은 요약 없이 버림)
-        if len(history_entries) > 12:
-            history_entries = history_entries[-12:]
+                # 반복 루프 감지: 같은 도구 호출(또는 같은 파일에 대한 write_file)이
+                # 연속으로 이어지면 진행이 없다는 뜻이므로 토큰을 더 태우기 전에 멈춘다.
+                sig = _action_signature(action)
+                if sig == last_signature:
+                    repeat_count += 1
+                else:
+                    last_signature = sig
+                    repeat_count = 1
+                if repeat_count >= _REPEAT_LOOP_THRESHOLD:
+                    log_fn(f"[에이전틱] 동일한 도구 호출이 {repeat_count}회 연속 반복되어 중단합니다: {sig[:200]}")
+                    stop_reason = "repeat_loop_detected"
+                    break
 
-        if finished:
-            done_summary = result
-            break
+        if max_cost_usd:
+            cost_so_far = _cumulative_cost_usd()
+            if cost_so_far >= max_cost_usd:
+                log_fn(f"[에이전틱] 누적 비용(${cost_so_far:.2f})이 상한(${max_cost_usd:.2f})을 초과해 중단합니다.")
+                stop_reason = "cost_limit_exceeded"
+                break
 
     success = done_summary is not None
-    if not success:
+    if stop_reason is None and not success:
+        stop_reason = "max_steps_reached"
         log_fn(f"[에이전틱] 최대 스텝({max_steps})에 도달했지만 done을 선언하지 않았습니다.")
 
     return {
         "success": success,
-        "reason": "done" if success else "max_steps_reached",
+        "reason": "done" if success else stop_reason,
         "steps_taken": steps_taken,
         "files_touched": files_touched,
         "summary": done_summary,

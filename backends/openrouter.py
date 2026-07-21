@@ -1,6 +1,14 @@
 """OpenRouter(OpenAI 호환 REST API) 기반 LLM 래퍼 — local_llm.LocalLLM과 동일한 인터페이스.
 
 config.yaml의 openrouter.enabled가 false인 동안은 어디서도 호출되지 않는다.
+
+프롬프트 캐싱: harness/agentic_loop.py는 매 스텝마다 거의 그대로인 대용량
+system 프롬프트(작업/프로젝트 지침)를 반복 전송하고 history만 바뀐다.
+system을 cache_control이 붙은 content-block 배열로 보내면, Anthropic
+계열 모델(anthropic/*)에서 OpenRouter가 이를 그대로 Anthropic API로
+전달해 반복되는 system 프리픽스가 캐시되어 비용이 크게 준다 — 캐싱이
+없으면 매 스텝 전체 system을 풀프라이스로 다시 처리하므로, 스텝 수에
+비례해 비용이 기하급수적으로 늘어난다.
 """
 import json
 import os
@@ -8,20 +16,56 @@ import requests
 
 from backends.json_repair import try_repair_truncated_json
 
+# system 프롬프트 캐싱을 시도할 최소 길이(대략적인 토큰 추정치 기준).
+# Anthropic 계열 모델의 최소 캐시 가능 프리픽스는 모델별로 1024~4096 토큰이라
+# 너무 짧은 system은 캐시 마커를 붙여도 조용히 캐시되지 않는다. 대략
+# 1자=~0.5토큰으로 보수적으로 잡아 이 문턱 미만이면 캐시 마커를 생략한다.
+_CACHE_MIN_CHARS = 2000
+# anthropic/ 계열이 아닌 모델(OpenAI, Google 등)에 Anthropic 전용
+# cache_control 블록을 보내면 provider가 거부할 수 있어 접두어로 판별한다.
+_CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/",)
+
 
 class OpenRouterLLM:
     def __init__(self, model: str, api_key: str = "",
-                 base_url: str = "https://openrouter.ai/api/v1", temperature: float = 0.2):
+                 base_url: str = "https://openrouter.ai/api/v1", temperature: float = 0.2,
+                 cache_system: bool = True):
         self.model = model
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         self.temperature = temperature
+        self.cache_system = cache_system
+        # 이 인스턴스로 수행된 모든 generate() 호출의 usage 누적치. agentic_loop는
+        # 매 스텝 같은 인스턴스로 여러 번 generate()를 호출하므로(agent.py가 작업
+        # 1건당 OpenRouterLLM을 새로 만듦), 인스턴스 수명 = 작업 1건 수명과 같아
+        # 여기 누적된 값이 곧 "이 작업에서 캐싱으로 절감한 총량"이 된다.
+        # generate()의 반환값(str|dict) 시그니처는 다른 호출부(agent.py, router.py)와
+        # 호환을 위해 그대로 두고, 캐시 통계는 cache_stats()로 별도 조회한다.
+        self._usage_totals = {
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
+    def _supports_cache_control(self) -> bool:
+        return self.cache_system and self.model.startswith(_CACHE_CONTROL_MODEL_PREFIXES)
 
     def generate(self, prompt: str, json_mode: bool = False, system: str = None, num_predict: int = 512) -> str | dict:
         """프롬프트를 보내고 응답을 받는다. (인터페이스는 LocalLLM.generate와 동일)"""
         messages = []
         if system:
-            messages.append({"role": "system", "content": system})
+            if self._supports_cache_control() and len(system) >= _CACHE_MIN_CHARS:
+                messages.append({
+                    "role": "system",
+                    "content": [{
+                        "type": "text",
+                        "text": system,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                })
+            else:
+                messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
         payload = {
@@ -44,6 +88,9 @@ class OpenRouterLLM:
         if not resp.ok:
             raise self._http_error(resp)
         body = resp.json()
+        usage = body.get("usage") or {}
+        for key in self._usage_totals:
+            self._usage_totals[key] += int(usage.get(key) or 0)
         choice = body["choices"][0]
         text = choice["message"]["content"]
         if text is None:
@@ -86,6 +133,22 @@ class OpenRouterLLM:
             if repaired is not None:
                 return repaired
             raise ValueError(f"OpenRouter가 유효한 JSON을 반환하지 않았습니다: {text[:300]}") from e
+
+    def cache_stats(self) -> dict:
+        """이 인스턴스가 수행한 모든 generate() 호출의 누적 프롬프트 캐시 통계.
+
+        OpenRouter는 anthropic/* 모델의 경우 Anthropic 원본 usage 필드
+        (cache_creation_input_tokens/cache_read_input_tokens)를 그대로
+        패스스루한다. 없으면 전부 0으로 채워 호출부가 매번 존재 여부를
+        따로 확인하지 않아도 되게 한다.
+        """
+        t = self._usage_totals
+        return {
+            "cache_read_tokens": t["cache_read_input_tokens"],
+            "cache_write_tokens": t["cache_creation_input_tokens"],
+            "prompt_tokens": t["prompt_tokens"],
+            "completion_tokens": t["completion_tokens"],
+        }
 
     def health_check(self) -> bool:
         if not self.api_key:
