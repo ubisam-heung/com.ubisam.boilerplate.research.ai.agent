@@ -88,9 +88,7 @@ class OpenRouterLLM:
         if not resp.ok:
             raise self._http_error(resp)
         body = resp.json()
-        usage = body.get("usage") or {}
-        for key in self._usage_totals:
-            self._usage_totals[key] += int(usage.get(key) or 0)
+        self._accumulate_usage(body.get("usage") or {})
         choice = body["choices"][0]
         text = choice["message"]["content"]
         if text is None:
@@ -100,6 +98,28 @@ class OpenRouterLLM:
         if json_mode:
             return self._parse_json(text)
         return text
+
+    def _accumulate_usage(self, usage: dict):
+        """usage 응답에서 토큰 통계를 누적한다.
+
+        실측 확인 결과, OpenRouter는 캐시 통계를 최상위 필드(cache_creation_input_tokens/
+        cache_read_input_tokens)가 아니라 usage.prompt_tokens_details.cache_write_tokens/
+        cached_tokens에 담아 반환한다(Amazon Bedrock·Anthropic 직접 provider 둘 다 동일한
+        형태로 실측 확인함, 2026-07-21). 과거 문서/코드는 Anthropic 원본 필드를 그대로
+        패스스루한다고 가정했으나 실제로는 아니었다 — 그 결과 캐시 통계가 항상 0으로 잡혀
+        cache_stats()가 실제 캐시 사용량을 반영하지 못하는 버그가 있었다.
+        최상위 필드도 함께 확인해, 향후 응답 형태가 바뀌거나 다른 provider가 원본 필드를
+        그대로 내려줘도 놓치지 않도록 한다(어느 쪽이든 값이 있으면 사용).
+        """
+        details = usage.get("prompt_tokens_details") or {}
+        self._usage_totals["cache_read_input_tokens"] += int(
+            usage.get("cache_read_input_tokens") or details.get("cached_tokens") or 0
+        )
+        self._usage_totals["cache_creation_input_tokens"] += int(
+            usage.get("cache_creation_input_tokens") or details.get("cache_write_tokens") or 0
+        )
+        self._usage_totals["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+        self._usage_totals["completion_tokens"] += int(usage.get("completion_tokens") or 0)
 
     def _post_chat(self, payload: dict):
         return requests.post(
@@ -137,10 +157,9 @@ class OpenRouterLLM:
     def cache_stats(self) -> dict:
         """이 인스턴스가 수행한 모든 generate() 호출의 누적 프롬프트 캐시 통계.
 
-        OpenRouter는 anthropic/* 모델의 경우 Anthropic 원본 usage 필드
-        (cache_creation_input_tokens/cache_read_input_tokens)를 그대로
-        패스스루한다. 없으면 전부 0으로 채워 호출부가 매번 존재 여부를
-        따로 확인하지 않아도 되게 한다.
+        실제 값 추출 위치는 _accumulate_usage() 참고(usage.prompt_tokens_details 하위).
+        캐시가 한 번도 없었으면 전부 0으로 채워 호출부가 매번 존재 여부를 따로
+        확인하지 않아도 되게 한다.
         """
         t = self._usage_totals
         return {

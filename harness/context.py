@@ -4,6 +4,24 @@ import re
 
 from harness import project_guide
 
+_CONVERSATION_HEADER = "직전 대화(최근 순서대로, 참고용 — 현재 작업이 여기서 이어지는 것일 수 있다):"
+
+
+def format_conversation_history(conversation_history: list[str] | None, limit: int = 5) -> str:
+    """대화형 세션의 직전 턴 입력들을 프롬프트에 얹을 짧은 텍스트로 변환한다.
+
+    "왜?", "그건 왜 안 돼?" 같은 후속 질문은 직전 턴을 참조해야 답이 나오는데,
+    이 컨텍스트가 없으면 모델이 매 턴을 독립된 새 질문으로 오해해 엉뚱한 답을
+    지어낸다(예: 관련 없는 파일을 억지로 찾아 답변). agentic_loop.run_loop와
+    agent.explain_task 양쪽 모두 이 헬퍼로 동일하게 포맷팅해, 코드 수정 경로와
+    설명 모드 경로 사이에 컨텍스트 유무가 갈리지 않게 한다.
+    """
+    if not conversation_history:
+        return ""
+    recent = conversation_history[-limit:]
+    lines = "\n".join(f"- {t}" for t in recent)
+    return f"\n{_CONVERSATION_HEADER}\n{lines}\n"
+
 # 작업 문자열에서 뽑아낼 "식별자성" 토큰: 코드/티켓 ID(G3-MSG-02), 함수명, 파일명 조각 등.
 # 파일명에는 없고 파일 "내용" 안에만 있는 키워드를 찾기 위한 grep 사전 필터에 쓴다.
 _IDENTIFIER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}(?:-\d+)?|\d{2,}")
@@ -65,11 +83,13 @@ def _wants_new_file(task: str) -> bool:
 
 FILE_SELECTION_PROMPT = """{guide}다음은 프로젝트의 파일 목록이다:
 {tree}
-
+{conversation}
 작업: {task}
 
 이 작업을 수행하기 위해 읽어야 할 파일을 최대 5개까지 선택해라.
 존재하는 파일 경로 중에서만 선택해라. 새로 만들어야 할 파일이 있다면 포함해도 된다.
+작업이 직전 대화를 이어받는 후속 질문(예: "왜?")이면, 그 직전 대화가 다루던 파일/주제와
+관련된 파일을 우선 고려해라 — 작업 문장 자체의 키워드만 보고 무관한 파일을 고르지 마라.
 JSON 배열로만 답해라. 예: ["src/api/routes.py", "src/models/user.py"]
 """
 
@@ -147,7 +167,7 @@ def grep_matching_files(task: str, root: str = ".", exclude_dirs: list[str] | No
 
 
 def select_relevant_files(llm, task: str, root: str = ".", exclude_dirs: list[str] | None = None,
-                          guide: str = "") -> list[str]:
+                          guide: str = "", conversation_history: list[str] | None = None) -> list[str]:
     tree = get_project_tree(root, exclude_dirs)
     if not tree:
         return []
@@ -155,7 +175,10 @@ def select_relevant_files(llm, task: str, root: str = ".", exclude_dirs: list[st
     # 1) 실제 grep으로 내용 안에 키워드가 있는 파일부터 찾는다 (가장 확실한 신호).
     grep_hits = grep_matching_files(task, root, exclude_dirs)
 
-    prompt = FILE_SELECTION_PROMPT.format(guide=project_guide.as_prelude(guide), tree=tree, task=task)
+    conv_text = format_conversation_history(conversation_history)
+    prompt = FILE_SELECTION_PROMPT.format(
+        guide=project_guide.as_prelude(guide), tree=tree, task=task, conversation=conv_text,
+    )
     try:
         result = llm.generate(prompt, json_mode=True)
     except Exception:

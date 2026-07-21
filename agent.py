@@ -180,13 +180,15 @@ def _run_agentic(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
 
 
 EXPLAIN_PROMPT = """다음은 사용자의 질문과 관련 코드다.
-
+{conversation}
 질문: {task}
 
 관련 파일:
 {file_contents}
 
-코드를 바탕으로 한국어로 명확하게 설명해라. 코드를 수정하지 말고 설명만 해라."""
+코드를 바탕으로 한국어로 명확하게 설명해라. 코드를 수정하지 말고 설명만 해라.
+질문이 직전 대화를 이어받는 후속 질문(예: "왜?", "그건 왜 안 돼?")이면, 직전 대화 내용을
+기준으로 답하고 관련 파일 검색 결과를 억지로 끌어와 답을 지어내지 마라."""
 
 _EXPLAIN_MAX_FILE_CHARS = 12000
 _EXPLAIN_MAX_TOTAL_CHARS = 36000
@@ -303,11 +305,18 @@ def _format_explain_contents(file_contents: dict[str, str]) -> str:
     return "\n\n".join(parts) or "(파일 내용을 읽지 못했습니다)"
 
 
-def explain_task(llm, task: str, work_root: str, exclude_dirs, log_fn, guide: str = "") -> None:
-    """수정 없이 코드를 읽고 질문에 답한다 (설명 모드)."""
+def explain_task(llm, task: str, work_root: str, exclude_dirs, log_fn, guide: str = "",
+                  conversation_history: list[str] | None = None) -> None:
+    """수정 없이 코드를 읽고 질문에 답한다 (설명 모드).
+
+    conversation_history: 같은 대화형 세션의 직전 턴 입력들. "직접 실행을 왜 못해?"처럼
+        직전 답변을 참조하는 후속 질문을, 매번 독립된 새 질문으로 오해해 관련 없는 파일을
+        억지로 찾아 엉뚱하게 답하는 것을 막기 위해 파일 선택과 프롬프트 양쪽에 전달한다.
+    """
     log_fn("[설명 모드] 코드를 읽고 답합니다 (수정하지 않음)")
     tree_paths = [p for p in context.get_project_tree(work_root, exclude_dirs).split("\n") if p]
-    files = context.select_relevant_files(llm, task, work_root, exclude_dirs, guide=guide)
+    files = context.select_relevant_files(llm, task, work_root, exclude_dirs, guide=guide,
+                                          conversation_history=conversation_history)
     if not files:
         files = _fallback_read_files(task, tree_paths, work_root, exclude_dirs)
     if not files:
@@ -317,8 +326,12 @@ def explain_task(llm, task: str, work_root: str, exclude_dirs, log_fn, guide: st
     log_fn(f"[설명 모드] 읽는 파일: {files}")
     file_contents = context.read_files(work_root, files)
     contents_str = _format_explain_contents(file_contents)
+    conv_text = context.format_conversation_history(conversation_history)
     try:
-        answer = llm.generate(EXPLAIN_PROMPT.format(task=task, file_contents=contents_str), num_predict=4096)
+        answer = llm.generate(
+            EXPLAIN_PROMPT.format(task=task, file_contents=contents_str, conversation=conv_text),
+            num_predict=4096,
+        )
     except Exception as exc:
         log_fn(f"[오류] 설명 생성 실패: {exc}")
         log_fn("        OpenRouter 모델명/API 키/컨텍스트 제한을 확인하세요.")
@@ -446,9 +459,12 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
     # 설명/질문형 작업은 수정 파이프라인 대신 읽기 전용 설명 모드로 처리한다.
     if force != "claude" and force != "codex" and _looks_like_question(task):
         if _is_general_information_request(task):
+            conv_text = context.format_conversation_history(conversation_history)
             try:
                 answer = main_llm.generate(
-                    f"사용자 질문: {task}\n\n당신은 AI 에이전트의 설명자다. 짧고 명확하게 한국어로 답해라. 프로젝트 파일을 읽지 말고, 일반적인 의미로 설명해라.",
+                    f"{conv_text}사용자 질문: {task}\n\n당신은 AI 에이전트의 설명자다. 짧고 명확하게 "
+                    "한국어로 답해라. 프로젝트 파일을 읽지 말고, 일반적인 의미로 설명해라. 질문이 "
+                    "직전 대화를 이어받는 후속 질문(예: \"왜?\")이면 직전 대화 내용을 기준으로 답해라.",
                     num_predict=200,
                 )
             except Exception as exc:
@@ -461,7 +477,8 @@ def run_agent(task: str, root: str = ".", log_fn=None, force: str = None, confir
                 log_fn("[안내] 모델이 빈 답변을 반환했습니다. 잠시 후 다시 시도해 주세요.")
             _rec("openrouter" if force == "openrouter" else "local", "explain")
             return
-        explain_task(main_llm, task, work_root, exclude_dirs, log_fn, guide=guide)
+        explain_task(main_llm, task, work_root, exclude_dirs, log_fn, guide=guide,
+                     conversation_history=conversation_history)
         _rec("openrouter" if force == "openrouter" else "local", "explain")
         return
 

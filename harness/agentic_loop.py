@@ -17,7 +17,7 @@ import os
 import re
 from datetime import datetime
 
-from harness import hooks, verifier
+from harness import context, hooks, verifier
 from harness.executor import (
     BlockApplyError, PathEscapeError, apply_blocks, apply_change, safe_full_path,
 )
@@ -310,11 +310,7 @@ def run_loop(llm, task: str, work_root: str, hook_roots, cfg: dict, log_fn,
         from harness import metrics as _metrics
         price_per_mtok = _metrics.DEFAULT_PRICE_PER_MTOK
 
-    conv_text = ""
-    if conversation_history:
-        recent = conversation_history[-5:]
-        lines = "\n".join(f"- {t}" for t in recent)
-        conv_text = f"\n직전 대화(최근 순서대로, 참고용 — 현재 작업이 여기서 이어지는 것일 수 있다):\n{lines}\n"
+    conv_text = context.format_conversation_history(conversation_history)
     system = SYSTEM_PROMPT.format(
         task=task, work_root=work_root, conversation=conv_text,
         guide=f"\n프로젝트 지침:\n{guide}\n" if guide else "",
