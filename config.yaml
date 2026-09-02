@@ -3,7 +3,7 @@
 local_llm:
   enabled: true
   provider: ollama
-  base_url: "http://192.168.0.229:11345"
+  base_url: "http://1ocalhost:11345"
   model: "qwen3.5:9b-mlx"
   temperature: 0.7
 
